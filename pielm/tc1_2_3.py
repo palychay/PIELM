@@ -13,7 +13,7 @@ def dd_phi(z):
     return -2 * t * (1 - t**2)
 
 
-# --- 2. Физика задачи TC-2 ---
+# --- 2. Физика задачи  ---
 def exact_u_tc1(x):
     # Из TC-1: sin(2*pi*x)*cos(4*pi*x) + 1
     return np.sin(2*np.pi*x) * np.cos(4*np.pi*x) + 1
@@ -148,6 +148,28 @@ class PIELM:
         return phi(Z) @ self.beta
  #--------------------------------------------------------------   
 
+
+def print_info(u_pred, u_true, N_hidden, N_f):
+    mse = np.mean((u_pred - u_true)**2)
+    print(f"Test Case 1 (Advection Equation)")
+    print(f"Neurons: {N_hidden}, Collocation Points: {N_f}")
+    print(f"MSE Error: {mse:.2e}")
+
+def draw_graphics(X_test, u_true, u_pred, x_f, name):
+    plt.figure(figsize=(10, 5))
+    plt.plot(X_test, u_true, 'b-', label='Exact Solution', linewidth=2)
+    plt.plot(X_test, u_pred, 'r--', label='PIELM Prediction', linewidth=2, dashes=(4, 4))
+    plt.scatter(x_f, np.zeros_like(x_f), color='green', marker='|', s=50, label='Collocation Pts')
+    plt.title(name)
+    plt.xlabel('x')
+    plt.ylabel('u(x)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+
+
 # 4. Настройки
 N_f = 40       # Точки коллокации
 N_bc = 2       # Граничные точки
@@ -169,23 +191,8 @@ X_test = np.linspace(0, 1, 100).reshape(-1, 1)
 u_pred = model_tc1.predict(X_test)
 u_true = exact_u_tc1(X_test)
 
-# Вывод ошибки
-mse = np.mean((u_pred - u_true)**2)
-print(f"Test Case 1 (Advection Equation)")
-print(f"Neurons: {N_hidden}, Collocation Points: {N_f}")
-print(f"MSE Error: {mse:.2e}")
-
-# Визуализация
-plt.figure(figsize=(10, 5))
-plt.plot(X_test, u_true, 'b-', label='Exact', linewidth=2)
-plt.plot(X_test, u_pred, 'r--', label='PIELM (pinv)', linewidth=2)
-plt.scatter(x_f, np.zeros_like(x_f), color='gray', marker='|', alpha=0.5, label='Collocation pts')
-plt.title('TC-1: 1D Advection Equation')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-
+print_info(u_pred ,u_true, N_hidden, N_f)
+draw_graphics(X_test, u_true, u_pred, x_f, 'TC-1: 1D Advection Equation')
 
 
 # --- ТЕСТ TC-2 (Диффузия/Вторая производная) ---
@@ -198,25 +205,13 @@ model_tc2.fit(x_f, x_b, y_b_tc2,
 u_pred_tc2 = model_tc2.predict(X_test)
 u_true_tc2 = exact_u_tc2(X_test)
 
-mse_tc2 = np.mean((u_pred_tc2 - u_true_tc2)**2)
-print(f"Test Case 2 (Diffusion Equation)")
-print(f"Neurons: {N_hidden}, Collocation Points: {N_f}")
-print(f"MSE Error: {mse_tc2:.2e}")
-
-plt.figure(figsize=(10, 5))
-plt.plot(X_test, u_true_tc2, 'b-', label='Exact')
-plt.plot(X_test, u_pred_tc2, 'r--', label='PIELM Prediction', dashes=(3, 3))
-plt.title('TC-2: Diffusion Equation')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-
+print_info(u_pred_tc2 ,u_true_tc2, N_hidden, N_f)
+draw_graphics(X_test, u_true_tc2, u_pred_tc2, x_f, 'TC-2: Diffusion Equation')
 
 
 # --- ТЕСТ TC-3 (Адвекция-Диффузия с параметром nu) ---
 nu_val = 0.2
-N_f_tc3 = 20        # Всего 20 точек внутри!
+N_f_tc3 = 20        # Всего 20 точек внутри
 N_bc_tc3 = 2
 N_hidden_tc3 = 22
 
@@ -226,27 +221,12 @@ Y_b_tc3 = np.array([[0.0], [1.0]])
 
 model_tc3 = PIELM(n_hidden=N_hidden_tc3, scale=5.0)
 # Используем lambda, чтобы "пробросить" nu в оператор
-model_tc3.fit(x_f, X_b_tc3, Y_b_tc3, 
+model_tc3.fit(X_f_tc3, X_b_tc3, Y_b_tc3, 
               operator_func=lambda W, b, X: adv_diff_operator_tc3(W, b, X, nu_val), 
               source_func=lambda x: np.zeros_like(x)) # В TC-3 правая часть 0
 
 u_pred_tc3 = model_tc3.predict(X_test)
 u_true_tc3 = exact_u_tc3(X_test, nu_val)
 
-# Ошибка
-mse_tc3 = np.mean((u_pred_tc3 - u_true_tc3)**2)
-print(f"Test Case 3 (Advection-Diffusion, nu={nu_val})")
-print(f"Neurons: {N_hidden_tc3}, Collocation Points: {N_f_tc3}")
-print(f"MSE Error: {mse_tc3:.2e}")
-
-# График
-plt.figure(figsize=(10, 5))
-plt.plot(X_test, u_true_tc3, 'b-', label='Exact Solution', linewidth=2)
-plt.plot(X_test, u_pred_tc3, 'r--', label='PIELM Prediction', linewidth=2, dashes=(4, 4))
-plt.scatter(X_f_tc3, np.zeros_like(X_f_tc3), color='green', marker='|', s=50, label='Collocation Pts')
-plt.title(f'TC-3: Advection-Diffusion (nu={nu_val})')
-plt.xlabel('x')
-plt.ylabel('u(x)')
-plt.legend()
-plt.grid(True)
-plt.show()
+print_info(u_pred_tc3 ,u_true_tc3, N_hidden_tc3, N_f_tc3)
+draw_graphics(X_test, u_true_tc3, u_pred_tc3, X_f_tc3, 'TC-3: Advection-Diffusion')
