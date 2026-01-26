@@ -1,0 +1,30 @@
+# Виртуальное окружение (самое важное, не заливай его!)
+venv/
+.venv/
+env/
+bin/
+lib/
+include/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Переменные окружения и секреты
+.env
+.flaskenv
+
+# Настройки IDE (VS Code, PyCharm)
+.vscode/
+.idea/
+*.swp
+
+# Базы данных (если используешь локально)
+*.sqlite3
+*.db
+
+# Папки сборки и дистрибутивы
+build/
+dist/
+*.egg-info/
