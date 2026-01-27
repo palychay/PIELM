@@ -51,24 +51,71 @@ def adv_diff_operator_tc3(W, b, X, nu):
     H_val = d_val - nu * dd_val
     return H_val
 
-#------2 Class PIELM------------------------------------------
+
+# ---2. 2D Операторы (Новые для TC-4, 5, 6) ---
+def advection_2d_operator(W, b, X, a=1.0, b_coef=1.0):
+    """
+    Уравнение (37): a * u_x + b * u_y = R
+    W имеет форму (2, n_hidden). 
+    W[0, :] - веса для x (w_x)
+    W[1, :] - веса для y (w_y)
+    """
+    Z = X @ W + b
+    
+    w_x = W[0, :]
+    w_y = W[1, :]
+    
+    # L[u] = phi'(Z) * (a * w_x + b * w_y)
+    H_val = d_phi(Z) * (a * w_x + b_coef * w_y)
+    return H_val
+
+def diffusion_2d_operator(W, b, X):
+    """
+    Уравнение Лапласа/Пуассона : u_xx + u_yy = R
+    """
+    Z = X @ W + b
+    
+    w_x = W[0, :]
+    w_y = W[1, :]
+    
+    # Вторая производная сложной функции:
+    # u_xx = phi''(Z) * w_x^2
+    # u_yy = phi''(Z) * w_y^2
+    # L[u] = phi''(Z) * (w_x^2 + w_y^2)
+    H_val = dd_phi(Z) * (w_x**2 + w_y**2)
+    return H_val
+
+
+#------3 Class PIELM------------------------------------------
 class PIELM:
-    def __init__(self, n_hidden, scale=5.0):
+    def __init__(self, n_hidden, input_dim=1, scale=5.0):
         self.n_hidden = n_hidden
+        self.input_dim = input_dim # 1 для 1D, 2 для 2D
         self.scale = scale
         self.W = None
         self.b = None
         self.beta = None
         
     def fit(self, X_f, X_b, Y_b, operator_func, source_func):
+        """
+        X_f: Точки коллокации (N_f, input_dim)
+        X_b: Граничные точки (N_b, input_dim)
+        Y_b: Значения на границе (N_b, 1)
+        """
         # 1. Инициализация весов
-        self.W = np.random.normal(0, self.scale, (1, self.n_hidden))
+        self.W = np.random.normal(0, self.scale, (self.input_dim, self.n_hidden))
         self.b = np.random.normal(0, self.scale, (1, self.n_hidden))
         
         # 2. Матрица для физики (внутренние точки)
-        # operator_func должен возвращать H_f на основе W и b
+        # operator_func должен возвращает H_f на основе W и b
         H_f = operator_func(self.W, self.b, X_f)
-        Y_f = source_func(X_f)
+
+        # Вычисляем правую часть R(x, y)
+        if self.input_dim == 1:
+            Y_f = source_func(X_f)
+        else:
+            # Для 2D передаем x и y отдельно
+            Y_f = source_func(X_f[:, 0], X_f[:, 1]).reshape(-1, 1)
         
         # 3. Матрица для граничных условий
         Z_b = X_b @ self.W + self.b
@@ -88,11 +135,12 @@ class PIELM:
  #--------------------------------------------------------------   
 
 
-def print_info(u_pred, u_true, N_hidden, N_f):
+def print_info(u_pred, u_true, N_hidden, N_f, title="Test Case"):
     mse = np.mean((u_pred - u_true)**2)
-    print(f"Test Case 1 (Advection Equation)")
+    print(f"--- {title} ---")
     print(f"Neurons: {N_hidden}, Collocation Points: {N_f}")
     print(f"MSE Error: {mse:.2e}")
+    print("-" * 30)
 
 def draw_graphics(X_test, u_true, u_pred, x_f, name):
     plt.figure(figsize=(10, 5))
@@ -104,4 +152,33 @@ def draw_graphics(X_test, u_true, u_pred, x_f, name):
     plt.ylabel('u(x)')
     plt.legend()
     plt.grid(True)
+    plt.show()
+
+def draw_graphics_2d(X_test, u_true, u_pred, title="PIELM 2D Result"):
+    """
+    Универсальная отрисовка для 2D задач.
+    Сравнивает точное решение, результат модели и показывает карту ошибок.
+    """
+    error = np.abs(u_true - u_pred)
+    
+    fig, ax = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Список для итерации: (данные, заголовок, цветовая карта)
+    plots = [
+        (u_true, "Exact Solution", "jet"),
+        (u_pred, "PIELM Prediction", "jet"),
+        (error, "Absolute Error", "viridis")
+    ]
+    
+    for i, (data, t, cmap) in enumerate(plots):
+        # Используем scatter, так как X_test может быть произвольной формой (как звезда)
+        sc = ax[i].scatter(X_test[:, 0], X_test[:, 1], c=data.flatten(), cmap=cmap, s=10)
+        ax[i].set_title(t)
+        ax[i].set_xlabel("x")
+        ax[i].set_ylabel("y")
+        ax[i].axis("equal")
+        plt.colorbar(sc, ax=ax[i])
+    
+    plt.suptitle(title, fontsize=16)
+    plt.tight_layout()
     plt.show()
