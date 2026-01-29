@@ -6,41 +6,36 @@ import pielm
 # ЧАСТЬ 2: 2D Задачи (TC-4, TC-5, TC-6)
 # ==========================================
 
-# --- Геометрия: Звездообразная область ---
-def is_in_star_domain(x, y):
+def generate_square_data(N_f, N_b_per_side=50):
     """
-    Фильтр точек внутри "Звезды" (как в статье).
-    Уравнение в полярных координатах: r(theta) = R0 + A * cos(k * theta)
-    """
-    r = np.sqrt(x**2 + y**2)
-    theta = np.arctan2(y, x)
-    # 6 лучей, радиус меняется от 0.3 до 0.7 (примерно)
-    boundary_r = 0.5 + 0.2 * np.cos(6 * theta) 
-    return r <= boundary_r
-
-def generate_2d_data(N_total, domain_func):
-    """
-    Генерирует случайные точки внутри области и точки на границе.
-    """
-    # 1. Внутренние точки (метод Rejection Sampling)
-    points = []
-    while len(points) < N_total:
-        x_try = np.random.uniform(-1, 1, N_total*2)
-        y_try = np.random.uniform(-1, 1, N_total*2)
-        mask = domain_func(x_try, y_try)
-        valid = np.column_stack((x_try[mask], y_try[mask]))
-        points.extend(valid)
+    Генерирует данные для квадратной области [-1, 1] x [-1, 1].
     
-    X_f = np.array(points[:N_total])
+    Аргументы:
+    N_f -- количество точек коллокации внутри.
+    N_b_per_side -- количество точек на каждой из 4-х сторон квадрата.
+    """
+    # 1. Точки внутри (Collocation points)
+    # Просто равномерное распределение от -1 до 1
+    X_f = np.random.uniform(-1, 1, (N_f, 2))
 
-    # 2. Граничные точки (параметрически)
-    theta = np.linspace(0, 2*np.pi, 200) # 200 точек на границе
-    r_b = 0.5 + 0.2 * np.cos(6 * theta)
-    x_b = r_b * np.cos(theta)
-    y_b = r_b * np.sin(theta)
-    X_b = np.column_stack((x_b, y_b))
+    # 2. Граничные точки (Boundary points)
+    # Генерируем точки для 4 сторон квадрата
+    
+    # Нижняя сторона (y = -1)
+    bottom = np.column_stack((np.linspace(-1, 1, N_b_per_side), np.full(N_b_per_side, -1.0)))
+    # Верхняя сторона (y = 1)
+    top = np.column_stack((np.linspace(-1, 1, N_b_per_side), np.full(N_b_per_side, 1.0)))
+    # Левая сторона (x = -1)
+    left = np.column_stack((np.full(N_b_per_side, -1.0), np.linspace(-1, 1, N_b_per_side)))
+    # Правая сторона (x = 1)
+    right = np.column_stack((np.full(N_b_per_side, 1.0), np.linspace(-1, 1, N_b_per_side)))
+    
+    # Объединяем все границы
+    X_b = np.vstack((bottom, top, left, right))
     
     return X_f, X_b
+
+
 
 # --- ТОЧНЫЕ РЕШЕНИЯ И ИСТОЧНИКИ (Eq 40-42 в статье) ---
 
@@ -91,21 +86,21 @@ if __name__ == "__main__":
     # --- Запуск 2D задач ---
     print("\n=== Запуск 2D тестов (TC-4, TC-5, TC-6) ===")
     
-    # 1. Параметры обучения 
-    N_f_2d = 1000   # Точки внутри
-    N_hidden_2d = 800 
+# 1. Параметры
+    N_f_2d = 1000       # Точки внутри
+    N_b_side = 50       # Точек на одну сторону (всего будет 200)
+    N_hidden_2d = 800   # Нейроны
     
-    # 2. Генерируем данные для области "Звезда"
-    X_f, X_b = generate_2d_data(N_f_2d, is_in_star_domain)
+    # 2. Генерируем данные (Квадрат [-1, 1])
+    X_f, X_b = generate_square_data(N_f_2d, N_b_side)
     
     # 3. Генерируем тестовую сетку для валидации и графиков
-    x_lin = np.linspace(-1, 1, 60)
-    y_lin = np.linspace(-1, 1, 60)
+    x_lin = np.linspace(-1, 1, 50)
+    y_lin = np.linspace(-1, 1, 50)
     xx, yy = np.meshgrid(x_lin, y_lin)
-    flat_x, flat_y = xx.flatten(), yy.flatten()
-    # Фильтруем тестовые точки, чтобы проверять только внутри звезды
-    mask_test = is_in_star_domain(flat_x, flat_y)
-    X_test_2d = np.column_stack((flat_x[mask_test], flat_y[mask_test]))
+
+    # Превращаем сетку в список точек (N, 2)
+    X_test_2d = np.column_stack((xx.flatten(), yy.flatten()))
 
     # --- TC-4: 2D Адвекция ---
     print("\nОбучение TC-4 (Адвекция)...")
