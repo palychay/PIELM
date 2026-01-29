@@ -86,6 +86,34 @@ def diffusion_2d_operator(W, b, X):
     return H_val
 
 
+
+def advection_unsteady_1d_operator(W, b, X, a_coeff=1.0):
+    """
+    Решает уравнение: u_t + a(x) * u_x = 0
+    X: (N, 2), где X[:,0] - это x, X[:,1] - это t
+    a_coeff: может быть числом (для TC-7) или массивом той же длины, что и X (для TC-8)
+    """
+    Z = X @ W + b
+    
+    # W имеет форму (2, N_hidden)
+    # W[0, :] -> веса для x
+    # W[1, :] -> веса для t
+    w_x = W[0, :]
+    w_t = W[1, :]
+    
+    # Производная по времени u_t
+    dt_val = d_phi(Z) * w_t
+    
+    # Производная по пространству u_x
+    dx_val = d_phi(Z) * w_x
+    
+    # Если коэффициент переменный (массив), нужно сделать reshape для broadcasting
+    if isinstance(a_coeff, np.ndarray):
+        a_coeff = a_coeff.reshape(-1, 1)
+        
+    # L[u] = u_t + a(x)*u_x
+    return dt_val + a_coeff * dx_val
+
 #------3 Class PIELM------------------------------------------
 class PIELM:
     def __init__(self, n_hidden, input_dim=1, scale=5.0):
