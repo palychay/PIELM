@@ -22,15 +22,10 @@ def generate_spacetime_data(N_f, N_b_side=50):
     t_init = np.zeros(N_b_side)
     bc_init = np.column_stack((x_init, t_init))
 
-    # Left Boundary (x=-1) - Inflow
     t_side = np.linspace(0, 0.5, N_b_side)
     x_left = np.full(N_b_side, -1.0)
     bc_left = np.column_stack((x_left, t_side))
     
-    # Right Boundary (x=1) - Outflow (иногда не требуется, если поток уходит, 
-    # но в PIELM лучше задать для стабильности, если знаем решение, или оставить пустым)
-    # В статье для TC-8 (inflow) часто задают только вход. 
-    # Но для теста зададим обе границы для точности, если решение известно.
     x_right = np.full(N_b_side, 1.0)
     bc_right = np.column_stack((x_right, t_side))
 

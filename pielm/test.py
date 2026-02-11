@@ -12,7 +12,6 @@ def exact_u_tc2(x):
 
 def exact_u_tc3(x, nu):
     # u(x) = (exp(x/nu) - 1) / (exp(1/nu) - 1)
-    # Используем expm1 для точности при малых числах
     numerator = np.expm1(x / nu)
     denominator = np.expm1(1.0 / nu)
     return numerator / denominator
@@ -33,7 +32,6 @@ def source_R_tc2(x):
     # u'' = f''g + 2f'g' + fg''
     
     # f = sin(pi*x/2), g = cos(2*pi*x)
-    # Аргументы для краткости
     a = np.pi * x / 2
     b = 2 * np.pi * x
     
@@ -112,7 +110,6 @@ X_b_tc3 = np.array([[0.0], [1.0]])
 Y_b_tc3 = np.array([[0.0], [1.0]])
 
 model_tc3 = pielm.PIELM(n_hidden=N_hidden_tc3, scale=5.0)
-# Используем lambda, чтобы "пробросить" nu в оператор
 model_tc3.fit(X_f_tc3, X_b_tc3, Y_b_tc3, 
               operator_func=lambda W, b, X: pielm.adv_diff_operator_tc3(W, b, X, nu_val), 
               source_func=lambda x: np.zeros_like(x)) # В TC-3 правая часть 0

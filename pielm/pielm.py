@@ -71,7 +71,7 @@ def advection_2d_operator(W, b, X, a=1.0, b_coef=1.0):
 
 def diffusion_2d_operator(W, b, X):
     """
-    Уравнение Лапласа/Пуассона : u_xx + u_yy = R
+    Уравнение: u_xx + u_yy = R
     """
     Z = X @ W + b
     
@@ -135,7 +135,7 @@ class PIELM:
         self.b = np.random.normal(0, self.scale, (1, self.n_hidden))
         
         # 2. Матрица для физики (внутренние точки)
-        # operator_func должен возвращает H_f на основе W и b
+        # operator_func возвращает H_f на основе W и b
         H_f = operator_func(self.W, self.b, X_f)
 
         # Вычисляем правую часть R(x, y)
@@ -148,7 +148,6 @@ class PIELM:
         # 3. Матрица для граничных условий
         Z_b = X_b @ self.W + self.b
         H_b = phi(Z_b)
-        # Y_b уже содержит значения на границах
         
         # 4. Сборка глобальной системы H * beta = Y
         H = np.vstack((H_f, H_b))
