@@ -114,6 +114,39 @@ def advection_unsteady_1d_operator(W, b, X, a_coeff=1.0):
     # L[u] = u_t + a(x)*u_x
     return dt_val + a_coeff * dx_val
 
+
+# Оператор для TC-9 (1D Unsteady Advection-Diffusion)
+# Уравнение: u_t + a*u_x = nu * u_xx
+def adv_diff_1d_unsteady_operator(W, b, X, a=1.0, nu=0.01):
+    Z = X @ W + b
+    w_x = W[0, :]
+    w_t = W[1, :]
+    
+    dt_val = d_phi(Z) * w_t           # u_t
+    dx_val = d_phi(Z) * w_x           # u_x
+    ddx_val = dd_phi(Z) * (w_x**2)    # u_xx
+    
+    # u_t + a*u_x - nu*u_xx
+    return dt_val + a * dx_val - nu * ddx_val
+
+# Оператор для TC-10 (2D Unsteady Advection-Diffusion)
+# Уравнение: u_t + a*u_x + b*u_y = nu * (u_xx + u_yy)
+def adv_diff_2d_unsteady_operator(W, b, X, a=1.0, b_coef=1.0, nu=0.01):
+    Z = X @ W + b
+    w_x = W[0, :]
+    w_y = W[1, :]
+    w_t = W[2, :]
+    
+    dt_val = d_phi(Z) * w_t
+    
+    d_adv = d_phi(Z) * (a * w_x + b_coef * w_y)      # a*u_x + b*u_y
+    d_diff = dd_phi(Z) * (w_x**2 + w_y**2)           # u_xx + u_yy
+    
+    # u_t + Adv - nu*Diff
+    return dt_val + d_adv - nu * d_diff
+
+
+
 #------3 Class PIELM------------------------------------------
 class PIELM:
     def __init__(self, n_hidden, input_dim=1, scale=5.0):
@@ -141,9 +174,12 @@ class PIELM:
         # Вычисляем правую часть R(x, y)
         if self.input_dim == 1:
             Y_f = source_func(X_f)
-        else:
+        elif self.input_dim == 2:
             # Для 2D передаем x и y отдельно
             Y_f = source_func(X_f[:, 0], X_f[:, 1]).reshape(-1, 1)
+        elif self.input_dim == 3:
+            # Для TC-10: x, y, t
+            Y_f = source_func(X_f[:, 0], X_f[:, 1], X_f[:, 2]).reshape(-1, 1)
         
         # 3. Матрица для граничных условий
         Z_b = X_b @ self.W + self.b
