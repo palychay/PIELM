@@ -245,3 +245,125 @@ def draw_graphics_2d(X_test, u_true, u_pred, title="PIELM 2D Result"):
     plt.suptitle(title, fontsize=16)
     plt.tight_layout()
     plt.show()
+
+
+
+
+# -----------------------------------------------------------
+#  GENETIC ALGORITHM FOR PIELM
+# -----------------------------------------------------------
+class GeneticOptimizer:
+    def __init__(self, n_pop=20, n_gen=10, 
+                 scale_bounds=(0.1, 15.0), 
+                 hidden_bounds=(10, 500)):
+        """
+        n_pop: размер популяции (сколько моделей проверяем за раз)
+        n_gen: количество поколений
+        scale_bounds: (min, max) для scale
+        hidden_bounds: (min, max) для количества нейронов
+        """
+        self.n_pop = n_pop
+        self.n_gen = n_gen
+        self.scale_min, self.scale_max = scale_bounds
+        self.hidden_min, self.hidden_max = hidden_bounds
+        self.best_params = None
+        self.best_loss = float('inf')
+        self.history = []
+
+    def _init_population(self):
+        # Популяция: список словарей {'scale': float, 'n_hidden': int}
+        pop = []
+        for _ in range(self.n_pop):
+            ind = {
+                'scale': np.random.uniform(self.scale_min, self.scale_max),
+                'n_hidden': int(np.random.randint(self.hidden_min, self.hidden_max))
+            }
+            pop.append(ind)
+        return pop
+
+    def _fitness(self, individual, X_f, X_b, Y_b, operator_func, source_func):
+        # 1. Создаем модель с генами индивида
+        model = PIELM(n_hidden=individual['n_hidden'], scale=individual['scale'])
+        
+        # 2. Обучаем
+        try:
+            model.fit(X_f, X_b, Y_b, operator_func, source_func)
+            
+            # 3. Считаем ошибку (Loss)
+            # L[u] - R(x) должно быть равно 0.
+            
+            # Предсказываем веса и производные через оператор
+            # H_f * beta ≈ Y_f
+            H_f = operator_func(model.W, model.b, X_f)
+            residual_pred = H_f @ model.beta
+            residual_true = source_func(X_f)
+            if residual_true.ndim == 1: residual_true = residual_true.reshape(-1, 1)
+                
+            mse_res = np.mean((residual_pred - residual_true)**2)
+            return mse_res
+            
+        except np.linalg.LinAlgError:
+            return float('inf') # Убиваем особи с ошибками
+
+    def _mutate(self, individual):
+        # Мутация scale (сдвиг на случайную величину)
+        if np.random.rand() < 0.3:
+            individual['scale'] += np.random.normal(0, 1.0)
+            individual['scale'] = np.clip(individual['scale'], self.scale_min, self.scale_max)
+        
+        # Мутация n_hidden
+        if np.random.rand() < 0.3:
+            individual['n_hidden'] += int(np.random.randint(-50, 50))
+            individual['n_hidden'] = np.clip(individual['n_hidden'], self.hidden_min, self.hidden_max)
+        
+        return individual
+
+    def _crossover(self, p1, p2):
+        # Скрещивание: берем среднее или случайный выбор
+        child = {
+            'scale': (p1['scale'] + p2['scale']) / 2,
+            'n_hidden': int((p1['n_hidden'] + p2['n_hidden']) / 2)
+        }
+        return child
+
+    def search(self, X_f, X_b, Y_b, operator_func, source_func, callback=None):
+        population = self._init_population()
+        
+        for gen in range(self.n_gen):
+            # Оценка
+            scores = []
+            for ind in population:
+                loss = self._fitness(ind, X_f, X_b, Y_b, operator_func, source_func)
+                scores.append((loss, ind))
+            
+            # Сортировка (меньше ошибка -> лучше)
+            scores.sort(key=lambda x: x[0])
+            
+            # Лучший в поколении
+            current_best_loss, current_best_params = scores[0]
+            if current_best_loss < self.best_loss:
+                self.best_loss = current_best_loss
+                self.best_params = current_best_params
+            
+            self.history.append(current_best_loss)
+            
+            if callback:
+                callback(gen, current_best_loss, current_best_params)
+            
+            # Селекция (Элитизм: берем топ 20%)
+            n_elites = int(self.n_pop * 0.2)
+            elites = [x[1] for x in scores[:n_elites]]
+            
+            # Создание нового поколения
+            new_pop = elites[:]
+            while len(new_pop) < self.n_pop:
+                # Случайные родители из элиты
+                p1 = elites[np.random.randint(0, len(elites))]
+                p2 = elites[np.random.randint(0, len(elites))]
+                child = self._crossover(p1, p2)
+                child = self._mutate(child)
+                new_pop.append(child)
+            
+            population = new_pop
+            
+        return self.best_params
