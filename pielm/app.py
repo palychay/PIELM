@@ -1,203 +1,692 @@
-import streamlit as st
+"""
+app.py  —  GA-PIELM · Уравнение Дарси
+Запуск:  streamlit run app.py
+Зависит: pielm.py (в той же папке)
+"""
+
+import time
 import numpy as np
-import matplotlib.pyplot as plt
-import pielm  # Файл с вашим классом PIELM
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
-# --- Настройка страницы ---
-st.set_page_config(page_title="PIELM Interactive Solver", layout="wide")
+from pielm import PIELM, GeneticOptimizer, diffusion_2d_operator
 
-st.title("🚀 Physics Informed Extreme Learning Machine (PIELM)")
-st.markdown("""
-Интерактивная среда для решения дифференциальных уравнений с помощью нейросетей.
-Выберите задачу, настройте параметры и найдите решение мгновенно.
-""")
+# ─────────────────────────────────────────────────────────────────────────────
+#  СТРАНИЦА
+# ─────────────────────────────────────────────────────────────────────────────
 
-# --- БОКОВАЯ ПАНЕЛЬ: Настройки ---
-st.sidebar.header("1. Выбор задачи")
-test_case = st.sidebar.selectbox(
-    "Test Case", 
-    ["TC-1: Advection", "TC-2: Diffusion", "TC-3: Advection-Diffusion", 
-     "TC-11: Sharp Gradient", "TC-12: High Frequency"]
+st.set_page_config(
+    page_title="GA-PIELM · Darcy",
+    page_icon="🌊",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.sidebar.header("2. Гиперпараметры")
-# Используем session_state, чтобы авто-подбор мог обновлять эти значения
-if 'n_hidden' not in st.session_state: st.session_state.n_hidden = 200
-if 'scale' not in st.session_state: st.session_state.scale = 2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#  ФИЗИКА   ∇²P = 0  на  [0,1]²
+#  P(0,y)=1,  P(1,y)=0,  ∂P/∂n=0 (top/bot)  →  P(x,y) = 1 − x
+# ─────────────────────────────────────────────────────────────────────────────
 
-n_hidden = st.sidebar.slider("Количество нейронов (N_hidden)", 10, 2000, st.session_state.n_hidden)
-scale = st.sidebar.slider("Масштаб весов (Scale)", 0.1, 20.0, st.session_state.scale, step=0.1)
-n_f = st.sidebar.slider("Точки коллокации (N_f)", 10, 500, 100)
+def darcy_operator(W, b, X, act_name="tanh"):
+    return diffusion_2d_operator(W, b, X, act_name=act_name)
 
-# Дополнительные параметры для специфических тестов
-nu_param = 0.1
-k_freq = 4.0
+def darcy_source(X):
+    return np.zeros((len(X), 1))
 
-if test_case == "TC-3: Advection-Diffusion":
-    nu_param = st.sidebar.number_input("Вязкость (nu)", 0.001, 1.0, 0.1, format="%.3f")
-elif test_case == "TC-11: Sharp Gradient":
-    nu_param = st.sidebar.number_input("Вязкость (nu)", 0.001, 1.0, 0.05, format="%.3f")
-elif test_case == "TC-12: High Frequency":
-    k_freq = st.sidebar.number_input("Частота (k)", 1.0, 20.0, 8.0)
-    nu_param = st.sidebar.number_input("Вязкость (nu)", 0.0001, 0.1, 0.0001, format="%.4f")
+def p_exact(x, y):
+    return 1.0 - x
 
-# --- ФУНКЦИЯ: Генерация данных и операторов ---
-def get_problem_data(case, n_f, nu, k):
-    # Данные для обучения
-    x_f = np.random.uniform(0, 1, (n_f, 1))
-    x_b = np.array([[0.0], [1.0]])
-    
-    # Данные для теста (графики)
-    x_test = np.linspace(0, 1, 300).reshape(-1, 1)
+def rmse_model(model, X):
+    return float(np.sqrt(np.mean(
+        (model.predict(X).ravel() - p_exact(X[:, 0], X[:, 1])) ** 2)))
 
-    if "TC-1" in case:
-        # u_x = R
-        exact = lambda x: np.sin(2*np.pi*x) * np.cos(4*np.pi*x) + 1
-        source = lambda x: 2*np.pi*np.cos(2*np.pi*x)*np.cos(4*np.pi*x) - 4*np.pi*np.sin(2*np.pi*x)*np.sin(4*np.pi*x)
-        operator = pielm.advection_operator_tc1
-        
-    elif "TC-2" in case:
-        # u_xx = R
-        exact = lambda x: np.sin(np.pi * x / 2) * np.cos(2 * np.pi * x) + 1
-        # Точная вторая производная
-        def source(x):
-            a, b = np.pi * x / 2, 2 * np.pi * x
-            f, g = np.sin(a), np.cos(b)
-            df, dg = (np.pi/2)*np.cos(a), -2*np.pi*np.sin(b)
-            ddf, ddg = -(np.pi/2)**2 * np.sin(a), -(2*np.pi)**2 * np.cos(b)
-            return ddf*g + 2*df*dg + f*ddg
-        operator = pielm.diffusion_operator_tc2
-        
-    elif "TC-3" in case:
-        # u_x - nu*u_xx = 0
-        exact = lambda x: np.expm1(x / nu) / np.expm1(1.0 / nu)
-        source = lambda x: np.zeros_like(x)
-        operator = lambda W, b, X: pielm.adv_diff_operator_tc3(W, b, X, nu=nu)
-        
-    elif "TC-11" in case:
-        # Sharp Gradient: -nu*u_xx + u_x = 0
-        exact = lambda x: np.expm1(x / nu) / np.expm1(1.0 / nu) # то же решение, что TC-3
-        source = lambda x: np.zeros_like(x)
-        operator = lambda W, b, X: pielm.adv_diff_operator_tc3(W, b, X, nu=nu)
-        
-    elif "TC-12" in case:
-        # High Freq: -nu*u_xx + u_x = source
-        exact = lambda x: np.sin(k * np.pi * x)
-        def source(x):
-            term1 = nu * (k * np.pi)**2 * np.sin(k * np.pi * x)
-            term2 = k * np.pi * np.cos(k * np.pi * x)
-            return term1 + term2
-        operator = lambda W, b, X: pielm.adv_diff_operator_tc3(W, b, X, nu=nu)
-        
-    return x_f, x_b, x_test, exact, source, operator
+def pde_res(model, X):
+    H = darcy_operator(model.W, model.b, X, act_name=model.act_name)
+    return float(np.mean((H @ model.beta).ravel() ** 2))
 
-# --- ЛОГИКА: Авто-подбор (Auto-ML) ---
-st.sidebar.markdown("---")
-if st.sidebar.button("🤖 AI Авто-подбор параметров"):
-    with st.spinner("Генетический алгоритм ищет лучшее решение..."):
-        # Получаем данные для оптимизации
-        x_f_opt, x_b_opt, _, exact_opt, source_opt, op_opt = get_problem_data(test_case, 100, nu_param, k_freq)
-        y_b_opt = exact_opt(x_b_opt)
-        
-        # Запускаем оптимизатор (проверьте, что GeneticOptimizer есть в pielm.py!)
-        try:
-            optimizer = pielm.GeneticOptimizer(n_pop=20, n_gen=15, 
-                                               scale_bounds=(0.5, 15.0), 
-                                               hidden_bounds=(50, 800))
-            
-            # Колбек для прогресс-бара
-            progress_bar = st.sidebar.progress(0)
-            status_text = st.sidebar.empty()
-            
-            def ga_callback(gen, loss, params):
-                progress_bar.progress((gen + 1) / 15)
-                status_text.text(f"Gen {gen}: Loss {loss:.2e}")
+# ─────────────────────────────────────────────────────────────────────────────
+#  ДАННЫЕ
+# ─────────────────────────────────────────────────────────────────────────────
 
-            best_params = optimizer.search(x_f_opt, x_b_opt, y_b_opt, op_opt, source_opt, callback=ga_callback)
-            
-            # Сохраняем в session_state и перезагружаем
-            st.session_state.n_hidden = best_params['n_hidden']
-            st.session_state.scale = best_params['scale']
-            st.success(f"Найдено! Scale: {best_params['scale']:.2f}, Neurons: {best_params['n_hidden']}")
-            st.rerun()
-            
-        except AttributeError:
-            st.error("Класс GeneticOptimizer не найден в pielm.py! Добавьте его, чтобы использовать эту кнопку.")
+@st.cache_data
+def make_colloc(n):
+    s = int(np.sqrt(n))
+    t = np.linspace(0, 1, s)
+    xx, yy = np.meshgrid(t, t)
+    return np.column_stack([xx.ravel(), yy.ravel()])
 
-# --- ОСНОВНОЙ ПРОЦЕСС ---
+@st.cache_data
+def make_grid():
+    t = np.linspace(0, 1, 60)
+    xx, yy = np.meshgrid(t, t)
+    return xx, yy, np.column_stack([xx.ravel(), yy.ravel()])
 
-# 1. Получаем данные
-x_f, x_b, x_test, exact_u, source_r, operator = get_problem_data(test_case, n_f, nu_param, k_freq)
-y_b = exact_u(x_b)
+@st.cache_data
+def make_bc(n_b=40):
+    t      = np.linspace(0, 1, n_b)
+    left   = np.column_stack([np.zeros(n_b), t])
+    right  = np.column_stack([np.ones(n_b),  t])
+    top    = np.column_stack([t, np.ones(n_b)])
+    bottom = np.column_stack([t, np.zeros(n_b)])
+    Xb = np.vstack([left, right, top, bottom])
+    Yb = np.concatenate([
+        np.ones(n_b), np.zeros(n_b),
+        p_exact(top[:, 0],    top[:, 1]),
+        p_exact(bottom[:, 0], bottom[:, 1]),
+    ])
+    return Xb, Yb
 
-# 2. Создаем и обучаем модель
-model = pielm.PIELM(n_hidden=n_hidden, scale=scale)
+# ─────────────────────────────────────────────────────────────────────────────
+#  ГА-ОБЁРТКА
+# ─────────────────────────────────────────────────────────────────────────────
 
-try:
-    model.fit(x_f, x_b, y_b, operator, source_r)
-    
-    # 3. Предсказание
-    u_pred = model.predict(x_test)
-    u_true = exact_u(x_test)
-    
-    # 4. Расчет ошибки уравнения (Residual) на тестовых точках
-    # Проверяем, насколько хорошо сеть выучила физику: L[u] - R ≈ 0
-    H_test = operator(model.W, model.b, x_test)
-    R_test = source_r(x_test)
-    if R_test.ndim == 1: R_test = R_test.reshape(-1, 1)
-    
-    residual = (H_test @ model.beta) - R_test
-    
-    mse_u = np.mean((u_true - u_pred)**2)
-    mse_res = np.mean(residual**2)
+def run_ga(Xf, Xb, Yb, n_pop, n_gen, seed, cb=None):
+    ga = GeneticOptimizer(
+        n_pop=n_pop, n_gen=n_gen,
+        hidden_bounds=(50, 600),
+        scale_bounds=(0.5, 10.0),
+        lambda_pde_bounds=(0.01, 10.0),
+        lambda_bc_bounds=(1.0, 100.0),
+        seed=seed,
+    )
 
-    # --- ВИЗУАЛИЗАЦИЯ ---
-    
-    # Метрики
-    c1, c2, c3 = st.columns(3)
-    c1.metric("MSE (Решение)", f"{mse_u:.2e}")
-    c2.metric("MSE (Уравнение/Физика)", f"{mse_res:.2e}")
-    c3.metric("Число условий", f"{n_f} + 2")
+    def _wrap(gen, loss, params):
+        if cb:
+            cb(gen + 1, n_gen, loss, params)
 
-    # Графики
-    tab1, tab2 = st.tabs(["📉 Решение u(x)", "physics Ошибка уравнения (Residual)"])
-    
-    with tab1:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(x_test, u_true, 'k-', label='Точное решение', linewidth=2, alpha=0.6)
-        ax.plot(x_test, u_pred, 'r--', label='PIELM Предсказание', linewidth=2)
-        
-        # Рисуем точки коллокации
-        ax.scatter(x_f, exact_u(x_f), color='blue', alpha=0.3, s=20, label='Точки коллокации')
-        ax.scatter(x_b, y_b, color='green', s=100, marker='x', label='Граничные условия', zorder=5)
-        
-        ax.set_title(f"Решение: {test_case}")
-        ax.set_xlabel("x")
-        ax.set_ylabel("u(x)")
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.5)
-        st.pyplot(fig)
-        
-    with tab2:
-        fig2, ax2 = plt.subplots(figsize=(10, 4))
-        ax2.plot(x_test, residual, 'g-', label='Residual (L[u] - R)')
-        ax2.axhline(0, color='black', linestyle='--', linewidth=1)
-        ax2.set_title("Ошибка выполнения дифференциального уравнения")
-        ax2.set_ylabel("Error")
-        ax2.legend()
-        ax2.grid(True)
-        st.pyplot(fig2)
-        st.caption("Если эта линия близка к нулю, значит нейросеть соблюдает закон физики.")
+    best_p = ga.search(Xf, Xb, Yb, darcy_operator, darcy_source, callback=_wrap)
 
-except np.linalg.LinAlgError:
-    st.error("Ошибка линейной алгебры! Вероятно, матрица вырождена. Попробуйте изменить Scale или количество нейронов.")
-except Exception as e:
-    st.error(f"Произошла ошибка: {e}")
+    model = PIELM(
+        n_hidden   = best_p["n_hidden"],
+        input_dim  = 2,
+        scale      = best_p["scale"],
+        act_name   = best_p["activation"],
+        lambda_pde = best_p["lambda_pde"],
+        lambda_bc  = best_p["lambda_bc"],
+        seed       = seed,
+    ).initialize()
+    model.fit(Xf, Xb, Yb, darcy_operator, darcy_source)
 
-# --- Доп. инфо ---
-with st.expander("ℹ️ Справка по параметрам"):
-    st.markdown("""
-    * **Scale**: Отвечает за "резкость" базисных функций. Для плавных решений (TC-1, TC-2) подходит 1.0-3.0. Для резких (TC-11, TC-12) нужно 5.0-15.0.
-    * **N_hidden**: Чем больше нейронов, тем точнее, но может возникнуть переобучение (шум).
-    * **N_f**: Количество точек внутри области, где мы "учим" физику.
-    """)
+    return model, best_p, ga.history
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ТЕМА PLOTLY  —  тёмная, все подписи и значения colorbar чётко видны
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BG   = "#1e1e2e"    # фон области графика
+_BG2  = "#16161e"    # фон бумаги (за графиком)
+_GRID = "#313244"    # линии сетки
+_TEXT = "#cdd6f4"    # основной текст, оси, тики
+_SUB  = "#7f849c"    # второстепенный текст
+
+# Базовый layout для всех фигур
+_PL = dict(
+    paper_bgcolor = _BG2,
+    plot_bgcolor  = _BG,
+    font          = dict(color=_TEXT, size=12, family="monospace"),
+    margin        = dict(l=50, r=20, t=50, b=40),
+    title_font    = dict(color=_TEXT, size=13),
+)
+
+# Стиль осей
+_AX = dict(
+    gridcolor  = _GRID,
+    zeroline   = False,
+    color      = _TEXT,           # цвет надписи оси и тиков
+    tickfont   = dict(color=_TEXT, size=11),
+    title_font = dict(color=_TEXT, size=11),
+    linecolor  = _GRID,
+    showline   = True,
+)
+
+# Базовый стиль colorbar — тёмный фон, светлый текст
+_CB_BASE = dict(
+    thickness    = 12,
+    outlinecolor = _GRID,
+    outlinewidth = 1,
+    tickfont     = dict(color=_TEXT, size=10),
+    title_font   = dict(color=_TEXT, size=10),
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ГРАФИКИ
+# ─────────────────────────────────────────────────────────────────────────────
+
+def chart_pressure(model, xx, yy, Xg):
+    """Три тепловые карты: PIELM, аналитика, |ошибка|."""
+    Pp = model.predict(Xg).reshape(xx.shape)
+    Pt = p_exact(xx, yy)
+    Pe = np.abs(Pp - Pt)
+
+    fig = make_subplots(
+        1, 3,
+        subplot_titles=["PIELM  P̂(x,y)", "Аналитика  1−x", "|Ошибка|"],
+        horizontal_spacing=0.12,
+    )
+    # Цвет заголовков подграфиков
+    for ann in fig.layout.annotations:
+        ann.font = dict(color=_TEXT, size=12)
+
+    # Первые два — давление (одинаковая шкала), третий — ошибка в scientific
+    for col, (z, cs, fmt) in enumerate(
+        [(Pp, "RdYlBu_r", ".2f"),
+         (Pt, "RdYlBu_r", ".2f"),
+         (Pe, "Reds",     ".2e")],   # <-- scientific для ошибки
+        start=1,
+    ):
+        cb_x = 0.305 * col - 0.085
+        fig.add_trace(go.Heatmap(
+            z=z, x=xx[0], y=yy[:, 0],
+            colorscale=cs, showscale=True,
+            colorbar=dict(x=cb_x, len=0.85, tickformat=fmt, **_CB_BASE),
+        ), row=1, col=col)
+        fig.update_xaxes(title_text="x", row=1, col=col, **_AX)
+        fig.update_yaxes(
+            title_text="y" if col == 1 else "",
+            row=1, col=col, **_AX,
+        )
+
+    fig.update_layout(**_PL, height=310, title_text="Поле давления")
+    return fig
+
+
+def chart_velocity(model, xx, yy, Xg):
+    """Тепловая карта скорости + стрелки направления."""
+    P   = model.predict(Xg).reshape(xx.shape)
+    ux  = -np.gradient(P, xx[0, 1] - xx[0, 0], axis=1)
+    uy  = -np.gradient(P, yy[1, 0] - yy[0, 0], axis=0)
+    spd = np.hypot(ux, uy)
+
+    s  = 6
+    xs = xx[::s, ::s].ravel()
+    ys = yy[::s, ::s].ravel()
+    us = ux[::s, ::s].ravel()
+    vs = uy[::s, ::s].ravel()
+    nrm = np.hypot(us, vs) + 1e-12
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        z=spd, x=xx[0], y=yy[:, 0],
+        colorscale="Blues", showscale=True,
+        # скорость ~1, показываем 3 знака после запятой
+        colorbar=dict(title="│u│", len=0.85, tickformat=".3f", **_CB_BASE),
+    ))
+    for xi, yi, ui, vi in zip(xs[::2], ys[::2],
+                               us[::2] / nrm[::2], vs[::2] / nrm[::2]):
+        fig.add_annotation(
+            x=xi + ui * 0.03, y=yi + vi * 0.03,
+            ax=xi, ay=yi,
+            axref="x", ayref="y",
+            arrowhead=2, arrowsize=1, arrowwidth=1.3,
+            arrowcolor="#89b4fa",
+        )
+
+    fig.update_layout(
+        **_PL, height=310,
+        title_text="Скорость фильтрации   u = −(k/μ) ∇P",
+    )
+    fig.update_xaxes(title="x", **_AX)
+    fig.update_yaxes(title="y", **_AX)
+    return fig
+
+
+def chart_profiles(model):
+    """Профили P(x) при y = 0.25, 0.5, 0.75."""
+    x      = np.linspace(0, 1, 300)
+    # Цвета catppuccin — хорошо видны на тёмном фоне
+    colors = ["#89b4fa", "#a6e3a1", "#f38ba8"]
+
+    fig = go.Figure()
+    for c, yv in zip(colors, [0.25, 0.5, 0.75]):
+        xy = np.column_stack([x, np.full_like(x, yv)])
+        # PIELM: сплошная с маркерами (видны даже при полном совпадении)
+        fig.add_trace(go.Scatter(
+            x=x, y=model.predict(xy).ravel(),
+            mode="lines+markers",
+            name=f"PIELM  y={yv}",
+            line=dict(color=c, width=2),
+            marker=dict(size=3, opacity=0.5),
+        ))
+        # Аналитика: пунктир того же цвета
+        fig.add_trace(go.Scatter(
+            x=x, y=p_exact(x, yv),
+            mode="lines",
+            name=f"Аналит. y={yv}",
+            line=dict(color=c, width=1.5, dash="dot"),
+        ))
+
+    fig.update_layout(
+        **_PL, height=310,
+        title_text="Профили P(x) при фиксированных y",
+        xaxis=dict(title="x", **_AX),
+        yaxis=dict(title="P", **_AX),
+        legend=dict(
+            font=dict(color=_TEXT, size=10),
+            bgcolor=_BG2,
+            bordercolor=_GRID,
+            borderwidth=1,
+        ),
+    )
+    return fig
+
+
+def chart_convergence(histories: dict):
+    """Кривые сходимости ГА (log шкала)."""
+    palette = px.colors.qualitative.D3
+    fig = go.Figure()
+    for i, (lbl, hist) in enumerate(histories.items()):
+        fig.add_trace(go.Scatter(
+            x=list(range(1, len(hist) + 1)), y=hist,
+            mode="lines+markers", name=lbl,
+            line=dict(color=palette[i % len(palette)], width=2),
+            marker=dict(size=5),
+        ))
+    fig.update_layout(
+        **_PL, height=290,
+        title_text="Сходимость ГА",
+        xaxis=dict(title="Поколение", **_AX),
+        yaxis=dict(title="RMSE", type="log", **_AX),
+        legend=dict(
+            font=dict(color=_TEXT, size=10),
+            bgcolor=_BG2, bordercolor=_GRID, borderwidth=1,
+        ),
+    )
+    return fig
+
+
+def chart_heatmap(df: pd.DataFrame):
+    """Тепловая карта RMSE: популяция × поколения."""
+    pivot = df.pivot(index="Популяция", columns="Поколения", values="RMSE")
+    zv    = np.log10(pivot.values.astype(float) + 1e-20)
+    txt   = [[f"{v:.1e}" for v in row] for row in pivot.values]
+
+    fig = go.Figure(go.Heatmap(
+        z=zv,
+        x=[str(c) for c in pivot.columns],
+        y=[str(r) for r in pivot.index],
+        colorscale="RdYlGn_r",
+        text=txt,
+        texttemplate="%{text}",
+        textfont=dict(size=11, color=_TEXT),
+        colorbar=dict(title="log₁₀(RMSE)", **_CB_BASE),
+    ))
+    fig.update_layout(
+        **_PL, height=310,
+        title_text="RMSE: популяция × поколения",
+        xaxis=dict(title="Поколения", **_AX),
+        yaxis=dict(title="Популяция", **_AX),
+    )
+    return fig
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SESSION STATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INIT: dict = {
+    "cfg_n_pop":     20,
+    "cfg_n_gen":     10,
+    "cfg_n_colloc":  400,       # значение по умолчанию для selectbox
+    "cfg_seed":      42,
+    "cfg_exp_pops":  [5, 10, 20],
+    "cfg_exp_gens":  [3, 5, 10],
+    "mode":          None,
+    "best_model":    None,
+    "best_params":   None,
+    "ga_history":    [],
+    "ga_elapsed":    0.0,
+    "exp_df":        None,
+    "exp_histories": {},
+}
+
+for _k, _v in _INIT.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+def clear_results():
+    """Сбросить результаты при изменении параметров."""
+    for k in ("mode", "best_model", "best_params", "ga_history",
+              "ga_elapsed", "exp_df", "exp_histories"):
+        st.session_state[k] = _INIT[k]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("## ⚙️ Параметры")
+
+    # Слайдеры — значение из session_state, без value=
+    st.slider(
+        "Размер популяции", min_value=5, max_value=50, step=5,
+        key="cfg_n_pop", on_change=clear_results,
+    )
+    st.slider(
+        "Число поколений", min_value=3, max_value=30, step=1,
+        key="cfg_n_gen", on_change=clear_results,
+    )
+
+    # ВАЖНО: selectbox с key= НЕ должен получать аргумент index=,
+    # иначе Streamlit выдаёт предупреждение о конфликте default/session_state.
+    # Streamlit сам читает текущее значение из session_state["cfg_n_colloc"].
+    st.selectbox(
+        "Коллокационных точек",
+        options=[100, 225, 400, 625, 900],
+        key="cfg_n_colloc",
+        on_change=clear_results,
+    )
+
+    st.number_input(
+        "Seed", min_value=0, step=1,
+        key="cfg_seed", on_change=clear_results,
+    )
+
+    st.divider()
+    st.markdown("**Эксперимент**")
+    st.multiselect(
+        "Популяции",  [5, 10, 15, 20, 30, 50],
+        key="cfg_exp_pops", on_change=clear_results,
+    )
+    st.multiselect(
+        "Поколения", [3, 5, 10, 15, 20],
+        key="cfg_exp_gens", on_change=clear_results,
+    )
+
+    btn_single = st.button("▶ Запустить ГА",          type="primary")
+    btn_exp    = st.button("🔬 Запустить эксперимент")
+
+    # ── Параметры модели: st.metric корректен в любой теме ───────────────────
+    st.divider()
+    st.markdown("**Параметры модели**")
+    sidebar_ph = st.empty()
+
+    def render_sidebar(params=None, rmse=None, pde=None):
+        with sidebar_ph.container():
+            if params is None:
+                st.caption("— нет данных —")
+                return
+            c1, c2 = st.columns(2)
+            c1.metric("Нейронов",  params["n_hidden"])
+            c2.metric("Активация", params["activation"])
+            c3, c4 = st.columns(2)
+            c3.metric("σ",      f"{params['scale']:.2f}")
+            c4.metric("λ_pde",  f"{params['lambda_pde']:.4f}")
+            c5, c6 = st.columns(2)
+            c5.metric("λ_bc",   f"{params['lambda_bc']:.2f}")
+            c6.metric("",       "")
+            if rmse is not None:
+                st.metric("RMSE",        f"{rmse:.3e}")
+            if pde is not None:
+                st.metric("Невязка PDE", f"{pde:.3e}")
+
+    # Начальный рендер при наличии сохранённой модели
+    _xx0, _yy0, _Xg0 = make_grid()
+    _Xf0 = make_colloc(st.session_state.cfg_n_colloc)
+    render_sidebar(
+        st.session_state.best_params,
+        rmse=rmse_model(st.session_state.best_model, _Xg0)
+             if st.session_state.best_model else None,
+        pde=pde_res(st.session_state.best_model, _Xf0)
+            if st.session_state.best_model else None,
+    )
+
+    st.divider()
+    st.markdown("**Уравнение Дарси**")
+    for _eq in ["∇·(k/μ ∇P) = 0", "u = −(k/μ) ∇P",
+                "P(0,y)=1,  P(1,y)=0", "∂P/∂n = 0 (top/bot)",
+                "Точное:  P = 1 − x"]:
+        st.code(_eq, language=None)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ШАПКА
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.title("🌊 GA-PIELM · Фильтрация Дарси")
+st.caption(
+    "Физически информированная ELM  ·  Генетический алгоритм  ·  "
+    "2D стационарное уравнение Дарси"
+)
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ДАННЫЕ
+# ─────────────────────────────────────────────────────────────────────────────
+
+Xf            = make_colloc(st.session_state.cfg_n_colloc)
+Xb, Yb        = make_bc()
+xx, yy, Xgrid = make_grid()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ГЛАВНЫЙ КОНТЕЙНЕР  (единый, заменяется целиком при каждом запуске)
+# ─────────────────────────────────────────────────────────────────────────────
+
+main = st.empty()
+
+# ─── Рендер одиночного запуска ────────────────────────────────────────────────
+
+def show_single():
+    model   = st.session_state.best_model
+    params  = st.session_state.best_params
+    history = st.session_state.ga_history
+    elapsed = st.session_state.ga_elapsed
+    if model is None:
+        return
+
+    rv = rmse_model(model, Xgrid)
+    pv = pde_res(model, Xf)
+
+    with main.container():
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("RMSE",        f"{rv:.2e}")
+        c2.metric("Невязка PDE", f"{pv:.2e}")
+        c3.metric("Нейронов",    str(params["n_hidden"]))
+        c4.metric("Активация",   params["activation"])
+        c5.metric("Время",       f"{elapsed:.1f} с")
+
+        with st.expander("Все гиперпараметры", expanded=False):
+            st.dataframe(pd.DataFrame([{
+                "N":       params["n_hidden"],
+                "act":     params["activation"],
+                "σ":       round(params["scale"],      3),
+                "λ_pde":   round(params["lambda_pde"], 4),
+                "λ_bc":    round(params["lambda_bc"],  3),
+                "RMSE":    f"{rv:.3e}",
+                "PDE res": f"{pv:.3e}",
+            }]), hide_index=True)
+
+        st.divider()
+        st.plotly_chart(chart_pressure(model, xx, yy, Xgrid), width="stretch")
+
+        col_v, col_p = st.columns(2)
+        with col_v:
+            st.plotly_chart(chart_velocity(model, xx, yy, Xgrid), width="stretch")
+        with col_p:
+            st.plotly_chart(chart_profiles(model), width="stretch")
+
+        if history:
+            st.plotly_chart(chart_convergence({"ГА": history}), width="stretch")
+
+
+# ─── Рендер эксперимента ──────────────────────────────────────────────────────
+
+def show_experiment():
+    df    = st.session_state.exp_df
+    hists = st.session_state.exp_histories
+    if df is None:
+        return
+
+    bi = df["RMSE"].idxmin()
+    with main.container():
+        st.success(
+            f"Лучший результат:  "
+            f"pop = **{df.loc[bi,'Популяция']}**  ·  "
+            f"gen = **{df.loc[bi,'Поколения']}**  ·  "
+            f"RMSE = **{df.loc[bi,'RMSE']:.3e}**"
+        )
+        df_fmt = df.copy()
+        df_fmt["RMSE"]        = df_fmt["RMSE"].map(lambda v: f"{v:.3e}")
+        df_fmt["Невязка PDE"] = df_fmt["Невязка PDE"].map(lambda v: f"{v:.3e}")
+        st.dataframe(df_fmt, hide_index=True)
+
+        st.divider()
+        col_h, col_c = st.columns(2)
+        with col_h:
+            st.plotly_chart(chart_heatmap(df), width="stretch")
+        with col_c:
+            if hists:
+                st.plotly_chart(chart_convergence(hists), width="stretch")
+
+        st.download_button(
+            "⬇ Скачать CSV",
+            data=df.to_csv(index=False).encode(),
+            file_name="ga_pielm_experiment.csv",
+            mime="text/csv",
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ЗАПУСК — одиночный ГА
+# ─────────────────────────────────────────────────────────────────────────────
+
+if btn_single:
+    clear_results()
+    st.session_state.mode = "single"
+
+    with main.container():
+        st.markdown("#### Оптимизация гиперпараметров")
+        prog   = st.progress(0)
+        status = st.empty()
+        log_ph = st.empty()
+        log    = []
+
+        def _cb(gen, total, loss, params):
+            prog.progress(gen / total)
+            status.markdown(
+                f"Поколение **{gen}/{total}**  ·  "
+                f"RMSE `{loss:.3e}`  ·  "
+                f"N = {params['n_hidden']}  ·  "
+                f"act = {params['activation']}"
+            )
+            log.append(
+                f"[{gen:02d}/{total}]  RMSE={loss:.3e}  "
+                f"N={params['n_hidden']:4d}  "
+                f"act={params['activation']:8s}  "
+                f"σ={params['scale']:.2f}  "
+                f"λ_pde={params['lambda_pde']:.3f}  "
+                f"λ_bc={params['lambda_bc']:.2f}"
+            )
+            log_ph.code("\n".join(log[-8:]))
+            render_sidebar(params, rmse=loss)
+
+        t0 = time.time()
+        model, best_p, history = run_ga(
+            Xf, Xb, Yb,
+            st.session_state.cfg_n_pop,
+            st.session_state.cfg_n_gen,
+            seed=int(st.session_state.cfg_seed),
+            cb=_cb,
+        )
+        elapsed = time.time() - t0
+        prog.progress(1.0)
+        status.success("✅ Оптимизация завершена")
+
+    st.session_state.best_model  = model
+    st.session_state.best_params = best_p
+    st.session_state.ga_history  = history
+    st.session_state.ga_elapsed  = elapsed
+
+    render_sidebar(best_p,
+                   rmse=rmse_model(model, Xgrid),
+                   pde=pde_res(model, Xf))
+    show_single()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ЗАПУСК — эксперимент
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif btn_exp and st.session_state.cfg_exp_pops and st.session_state.cfg_exp_gens:
+    clear_results()
+    st.session_state.mode = "experiment"
+
+    combos = [
+        (p, g)
+        for p in sorted(st.session_state.cfg_exp_pops)
+        for g in sorted(st.session_state.cfg_exp_gens)
+    ]
+
+    with main.container():
+        st.markdown("#### Сравнительный эксперимент")
+        prog = st.progress(0)
+        info = st.empty()
+        tbl  = st.empty()
+
+        rows            = {}
+        hists           = {}
+        best_params_map = {}
+
+        for i, (n_p, n_g) in enumerate(combos):
+            label = f"pop={n_p} · gen={n_g}"
+            info.markdown(f"⏳ **{label}**  ({i + 1}/{len(combos)})")
+
+            t0 = time.time()
+            m, p, h = run_ga(
+                Xf, Xb, Yb, n_p, n_g,
+                seed=int(st.session_state.cfg_seed),
+            )
+            elapsed = time.time() - t0
+
+            rv = rmse_model(m, Xgrid)
+            pv = pde_res(m, Xf)
+
+            rows[(n_p, n_g)] = {
+                "Популяция":    n_p,
+                "Поколения":    n_g,
+                "Оценок":       n_p * n_g,
+                "RMSE":         rv,
+                "Невязка PDE":  pv,
+                "Нейронов":     p["n_hidden"],
+                "Активация":    p["activation"],
+                "λ_pde":        round(p["lambda_pde"], 4),
+                "λ_bc":         round(p["lambda_bc"],  2),
+                "Время, с":     round(elapsed, 2),
+            }
+            best_params_map[(n_p, n_g)] = p
+            hists[label] = h
+            prog.progress((i + 1) / len(combos))
+
+            df_live = pd.DataFrame(list(rows.values())).copy()
+            df_live["RMSE"]        = df_live["RMSE"].map(lambda v: f"{v:.3e}")
+            df_live["Невязка PDE"] = df_live["Невязка PDE"].map(lambda v: f"{v:.3e}")
+            tbl.dataframe(df_live, hide_index=True)
+
+            best_key = min(rows, key=lambda k: rows[k]["RMSE"])
+            render_sidebar(
+                best_params_map[best_key],
+                rmse=rows[best_key]["RMSE"],
+                pde=rows[best_key]["Невязка PDE"],
+            )
+
+        info.success("✅ Эксперимент завершён")
+
+    st.session_state.exp_df        = pd.DataFrame(list(rows.values()))
+    st.session_state.exp_histories = hists
+    show_experiment()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ПОВТОРНЫЙ РЕНДЕР  (перезагрузка без нажатия кнопок)
+# ─────────────────────────────────────────────────────────────────────────────
+
+else:
+    mode = st.session_state.mode
+    if mode == "single" and st.session_state.best_model is not None:
+        show_single()
+    elif mode == "experiment" and st.session_state.exp_df is not None:
+        show_experiment()
+    else:
+        with main.container():
+            st.info(
+                "Настройте параметры в боковой панели и нажмите  "
+                "**▶ Запустить ГА**  или  **🔬 Запустить эксперимент**."
+            )
