@@ -1,931 +1,874 @@
-"""
-app.py — GA-PIELM / FGA-PIELM · Уравнение Дарси
-Запуск: streamlit run app.py
-"""
-
 import time
 import numpy as np
-import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 
-from pielm import (
-    PIELM, GeneticOptimizer, FuzzyGeneticOptimizer,
-    diffusion_2d_operator,
-    train_test_split_colloc,
+from equations.piezo import (
+    pde_operator_piezo, rhs_piezo,
+    boundary_conditions_piezo,
+    PIEZO_SOURCE_VARIANTS,
 )
 
+
+from equations.poisson import (
+    pde_operator_poisson, rhs_poisson,
+    boundary_conditions_poisson,
+    POISSON_SOURCE_VARIANTS,
+)
+
+from models.pielm import PIELM, ACTIVATIONS
+from models.genetic import GeneticOptimizer
+
+from solvers.fdm import FDMPoisson, FDMPiezo
+
+from utils.collocation import (
+    make_collocation_points,
+    train_test_split,
+    get_grid_for_plot,
+    count_points,
+    SAMPLING_STRATEGIES_2D,
+    SAMPLING_STRATEGIES_3D,
+)
+
+from ui.plots import (
+    plot_ga_progress,
+    plot_pielm_solution,
+    plot_pielm_vs_fdm,
+    plot_piezo_time_slice,
+    plot_piezo_evolution,
+    plot_comparison_bar,
+    plot_collocation_points,
+    plot_source_field,
+)
+
+from ui.export import (
+    build_report_txt,
+    report_to_bytes,
+    build_plots_zip,
+    make_filename,
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  СТРАНИЦА
+# Конфигурация страницы
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="GA-PIELM · Darcy",
-    page_icon="🌊",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title='PIELM + GA — Решение уравнений фильтрации',
+    page_icon='💧',
+    layout='wide',
+    initial_sidebar_state='expanded',
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ФИЗИКА   ∇²P = 0  →  P(x,y) = 1 − x
-# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main-title {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1e3a5f;
+        margin-bottom: 0.2rem;
+    }
+    .sub-title {
+        font-size: 1rem;
+        color: #4a6fa5;
+        margin-bottom: 1.5rem;
+    }
+    .section-header {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: #1e3a5f;
+        border-bottom: 2px solid #2563EB;
+        padding-bottom: 0.3rem;
+        margin-top: 1rem;
+        margin-bottom: 0.8rem;
+    }
+    div[data-testid="stSidebar"] {
+        background-color: #f8faff;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def darcy_operator(W, b, X, act_name="tanh"):
-    return diffusion_2d_operator(W, b, X, act_name=act_name)
-
-def darcy_source(X):
-    return np.zeros((len(X), 1))
-
-def p_exact(x, y):
-    return 1.0 - x
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ДАННЫЕ
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_data
-def make_colloc(n):
-    s = int(np.sqrt(n))
-    t = np.linspace(0, 1, s)
-    xx, yy = np.meshgrid(t, t)
-    return np.column_stack([xx.ravel(), yy.ravel()])
-
-@st.cache_data
-def make_grid():
-    t = np.linspace(0, 1, 60)
-    xx, yy = np.meshgrid(t, t)
-    return xx, yy, np.column_stack([xx.ravel(), yy.ravel()])
-
-@st.cache_data
-def make_bc(n_b=40):
-    t      = np.linspace(0, 1, n_b)
-    left   = np.column_stack([np.zeros(n_b), t])
-    right  = np.column_stack([np.ones(n_b),  t])
-    top    = np.column_stack([t, np.ones(n_b)])
-    bottom = np.column_stack([t, np.zeros(n_b)])
-    Xb = np.vstack([left, right, top, bottom])
-    Yb = np.concatenate([
-        np.ones(n_b), np.zeros(n_b),
-        p_exact(top[:, 0],    top[:, 1]),
-        p_exact(bottom[:, 0], bottom[:, 1]),
-    ])
-    return Xb, Yb
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ЗАПУСК ОДНОГО АЛГОРИТМА (GA или FGA)
+# Заголовок
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_optimizer(Xf_all, Xb, Yb, n_pop, n_gen, seed, use_fuzzy, cb=None):
-    """
-    Общая функция запуска GA или FGA.
-    Возвращает: model, best_p, history, X_train, X_test,
-                rmse_tr, rmse_te, fuzzy_log (None для GA)
-    """
-    X_train, X_test, _, _ = train_test_split_colloc(Xf_all, test_size=0.25, seed=seed)
-
-    OptimizerClass = FuzzyGeneticOptimizer if use_fuzzy else GeneticOptimizer
-    opt = OptimizerClass(
-        n_pop=n_pop, n_gen=n_gen,
-        hidden_bounds=(50, 600),
-        scale_bounds=(0.5, 10.0),
-        lambda_pde_bounds=(0.01, 10.0),
-        lambda_bc_bounds=(1.0, 100.0),
-        seed=seed,
-    )
-
-    def _wrap(gen, loss, params):
-        if cb:
-            cb(gen + 1, n_gen, loss, params)
-
-    best_p = opt.search(
-        X_train, Xb, Yb, darcy_operator, darcy_source, p_exact,
-        callback=_wrap,
-    )
-
-    model = PIELM(
-        n_hidden=best_p["n_hidden"], input_dim=2,
-        scale=best_p["scale"], act_name=best_p["activation"],
-        lambda_pde=best_p["lambda_pde"], lambda_bc=best_p["lambda_bc"],
-        seed=seed,
-    ).initialize()
-    model.fit(X_train, Xb, Yb, darcy_operator, darcy_source)
-
-    rmse_tr = model.rmse(X_train, p_exact(X_train[:, 0], X_train[:, 1]))
-    rmse_te = model.rmse(X_test,  p_exact(X_test[:, 0],  X_test[:, 1]))
-
-    fuzzy_log = getattr(opt, 'fuzzy_log', None)
-    return model, best_p, opt.history, X_train, X_test, rmse_tr, rmse_te, fuzzy_log
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ТЕМА PLOTLY
-# ─────────────────────────────────────────────────────────────────────────────
-
-_BG   = "#1e1e2e"
-_BG2  = "#16161e"
-_GRID = "#313244"
-_TEXT = "#cdd6f4"
-
-_PL = dict(
-    paper_bgcolor=_BG2, plot_bgcolor=_BG,
-    font=dict(color=_TEXT, size=12, family="monospace"),
-    margin=dict(l=50, r=20, t=50, b=40),
-    title_font=dict(color=_TEXT, size=13),
-)
-_AX = dict(
-    gridcolor=_GRID, zeroline=False, color=_TEXT,
-    tickfont=dict(color=_TEXT, size=11),
-    title_font=dict(color=_TEXT, size=11),
-    linecolor=_GRID, showline=True,
-)
-_CB = dict(
-    thickness=12, outlinecolor=_GRID, outlinewidth=1,
-    tickfont=dict(color=_TEXT, size=10),
-    title_font=dict(color=_TEXT, size=10),
+st.markdown('<div class="main-title">💧 PIELM + Генетический алгоритм</div>',
+            unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-title">'
+    'Физически информированное экстремальное машинное обучение '
+    'для решения уравнений фильтрации'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ГРАФИКИ
-# ─────────────────────────────────────────────────────────────────────────────
-
-def chart_pressure(model, xx, yy, Xg):
-    Pp = model.predict(Xg).reshape(xx.shape)
-    Pt = p_exact(xx, yy)
-    Pe = np.abs(Pp - Pt)
-    fig = make_subplots(1, 3,
-        subplot_titles=["PIELM  P̂(x,y)", "Аналитика  1−x", "|Ошибка|"],
-        horizontal_spacing=0.12)
-    for ann in fig.layout.annotations:
-        ann.font = dict(color=_TEXT, size=12)
-    for col, (z, cs, fmt) in enumerate(
-        [(Pp, "RdYlBu_r", ".2f"), (Pt, "RdYlBu_r", ".2f"), (Pe, "Reds", ".2e")],
-        start=1):
-        fig.add_trace(go.Heatmap(
-            z=z, x=xx[0], y=yy[:, 0], colorscale=cs, showscale=True,
-            colorbar=dict(x=0.305*col-0.085, len=0.85, tickformat=fmt, **_CB),
-        ), row=1, col=col)
-        fig.update_xaxes(title_text="x", row=1, col=col, **_AX)
-        fig.update_yaxes(title_text="y" if col == 1 else "", row=1, col=col, **_AX)
-    fig.update_layout(**_PL, height=310, title_text="Поле давления")
-    return fig
-
-
-def chart_velocity(model, xx, yy, Xg):
-    P   = model.predict(Xg).reshape(xx.shape)
-    ux  = -np.gradient(P, xx[0, 1]-xx[0, 0], axis=1)
-    uy  = -np.gradient(P, yy[1, 0]-yy[0, 0], axis=0)
-    spd = np.hypot(ux, uy)
-    s   = 6
-    xs, ys = xx[::s, ::s].ravel(), yy[::s, ::s].ravel()
-    us, vs = ux[::s, ::s].ravel(), uy[::s, ::s].ravel()
-    nrm = np.hypot(us, vs) + 1e-12
-    fig = go.Figure()
-    fig.add_trace(go.Heatmap(
-        z=spd, x=xx[0], y=yy[:, 0], colorscale="Blues", showscale=True,
-        colorbar=dict(title="│u│", len=0.85, tickformat=".3f", **_CB),
-    ))
-    for xi, yi, ui, vi in zip(xs[::2], ys[::2], us[::2]/nrm[::2], vs[::2]/nrm[::2]):
-        fig.add_annotation(
-            x=xi+ui*0.03, y=yi+vi*0.03, ax=xi, ay=yi,
-            axref="x", ayref="y",
-            arrowhead=2, arrowsize=1, arrowwidth=1.3, arrowcolor="#89b4fa",
-        )
-    fig.update_layout(**_PL, height=310, title_text="Скорость фильтрации  u = −∇P")
-    fig.update_xaxes(title="x", **_AX)
-    fig.update_yaxes(title="y", **_AX)
-    return fig
-
-
-def chart_profiles(model):
-    x      = np.linspace(0, 1, 300)
-    colors = ["#89b4fa", "#a6e3a1", "#f38ba8"]
-    fig    = go.Figure()
-    for c, yv in zip(colors, [0.25, 0.5, 0.75]):
-        xy = np.column_stack([x, np.full_like(x, yv)])
-        fig.add_trace(go.Scatter(
-            x=x, y=model.predict(xy).ravel(),
-            mode="lines+markers", name=f"PIELM y={yv}",
-            line=dict(color=c, width=2), marker=dict(size=3, opacity=0.5),
-        ))
-        fig.add_trace(go.Scatter(
-            x=x, y=p_exact(x, yv), mode="lines", name=f"Аналит. y={yv}",
-            line=dict(color=c, width=1.5, dash="dot"),
-        ))
-    fig.update_layout(
-        **_PL, height=310, title_text="Профили P(x)",
-        xaxis=dict(title="x", **_AX), yaxis=dict(title="P", **_AX),
-        legend=dict(font=dict(color=_TEXT, size=10),
-                    bgcolor=_BG2, bordercolor=_GRID, borderwidth=1),
-    )
-    return fig
-
-
-def chart_convergence(histories: dict):
-    """Кривые сходимости — несколько серий на одном графике."""
-    palette = px.colors.qualitative.D3
-    fig = go.Figure()
-    for i, (lbl, hist) in enumerate(histories.items()):
-        fig.add_trace(go.Scatter(
-            x=list(range(1, len(hist)+1)), y=hist,
-            mode="lines+markers", name=lbl,
-            line=dict(color=palette[i % len(palette)], width=2),
-            marker=dict(size=5),
-        ))
-    fig.update_layout(
-        **_PL, height=290, title_text="Сходимость",
-        xaxis=dict(title="Поколение", **_AX),
-        yaxis=dict(title="RMSE", type="log", **_AX),
-        legend=dict(font=dict(color=_TEXT, size=10),
-                    bgcolor=_BG2, bordercolor=_GRID, borderwidth=1),
-    )
-    return fig
-
-
-def chart_heatmap(df: pd.DataFrame):
-    pivot = df.pivot(index="Популяция", columns="Поколения", values="RMSE test")
-    zv    = np.log10(pivot.values.astype(float) + 1e-20)
-    txt   = [[f"{v:.1e}" for v in row] for row in pivot.values]
-    fig   = go.Figure(go.Heatmap(
-        z=zv, x=[str(c) for c in pivot.columns],
-        y=[str(r) for r in pivot.index],
-        colorscale="RdYlGn_r", text=txt,
-        texttemplate="%{text}", textfont=dict(size=11, color=_TEXT),
-        colorbar=dict(title="log₁₀(RMSE)", **_CB),
-    ))
-    fig.update_layout(
-        **_PL, height=310, title_text="RMSE test: популяция × поколения",
-        xaxis=dict(title="Поколения", **_AX),
-        yaxis=dict(title="Популяция", **_AX),
-    )
-    return fig
-
-
-def chart_test_scatter(X_train, X_test, model):
-    err_tr = np.abs(model.predict(X_train).ravel() - p_exact(X_train[:, 0], X_train[:, 1]))
-    err_te = np.abs(model.predict(X_test).ravel()  - p_exact(X_test[:, 0],  X_test[:, 1]))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=X_train[:, 0], y=X_train[:, 1], mode="markers",
-        marker=dict(size=5, color=err_tr, colorscale="Blues", showscale=True,
-                    colorbar=dict(title="err train", x=0.45, **_CB)),
-        name="Train (75%)",
-    ))
-    fig.add_trace(go.Scatter(
-        x=X_test[:, 0], y=X_test[:, 1], mode="markers",
-        marker=dict(size=7, symbol="diamond", color=err_te,
-                    colorscale="Reds", showscale=True,
-                    colorbar=dict(title="err test", x=1.0, **_CB)),
-        name="Test (25%)",
-    ))
-    fig.update_layout(
-        **_PL, height=340, title_text="Ошибка на train и test точках",
-        xaxis=dict(title="x", **_AX),
-        yaxis=dict(title="y", scaleanchor="x", **_AX),
-        legend=dict(font=dict(color=_TEXT, size=11),
-                    bgcolor=_BG2, bordercolor=_GRID, borderwidth=1),
-    )
-    return fig
-
-
-def chart_fuzzy_log(fuzzy_log: list):
-    """
-    График нечёткого контроллера:
-    e1, e2 и итоговая p_mut по поколениям.
-    """
-    gens  = [d['gen'] + 1 for d in fuzzy_log]
-    e1s   = [d['e1']   for d in fuzzy_log]
-    e2s   = [d['e2']   for d in fuzzy_log]
-    pmuts = [d['p_mut'] for d in fuzzy_log]
-
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        subplot_titles=["Сигналы e₁ и e₂", "Вероятность мутации p_mut"],
-        vertical_spacing=0.15,
-    )
-    for ann in fig.layout.annotations:
-        ann.font = dict(color=_TEXT, size=12)
-
-    fig.add_trace(go.Scatter(
-        x=gens, y=e1s, mode="lines+markers", name="e₁ (разнообразие)",
-        line=dict(color="#89b4fa", width=2), marker=dict(size=5),
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=gens, y=e2s, mode="lines+markers", name="e₂ (улучшение)",
-        line=dict(color="#a6e3a1", width=2), marker=dict(size=5),
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=gens, y=pmuts, mode="lines+markers", name="p_mut",
-        line=dict(color="#f38ba8", width=2), marker=dict(size=6),
-        fill="tozeroy", fillcolor="rgba(243,139,168,0.15)",
-    ), row=2, col=1)
-
-    # Пороговые линии
-    for y, dash, lbl in [(0.5, "dot", "граница МАЛО/ВЕЛИКО"),
-                          (0.10, "dash", "LOW=0.10"),
-                          (0.30, "dash", "MED=0.30"),
-                          (0.60, "dash", "HIGH=0.60")]:
-        row_ = 1 if lbl.startswith("г") else 2
-        fig.add_hline(y=y, line_dash=dash, line_color="#585b70",
-                      line_width=1, row=row_, col=1)
-
-    fig.update_xaxes(title_text="Поколение", row=2, col=1, **_AX)
-    fig.update_yaxes(title_text="e₁, e₂", row=1, col=1, range=[0, 1], **_AX)
-    fig.update_yaxes(title_text="p_mut", row=2, col=1, range=[0, 0.75], **_AX)
-    fig.update_layout(
-        **_PL, height=420, title_text="Нечёткий контроллер мутации",
-        legend=dict(font=dict(color=_TEXT, size=10),
-                    bgcolor=_BG2, bordercolor=_GRID, borderwidth=1),
-    )
-    return fig
-
-
-def chart_ga_fga_compare(hist_ga, hist_fga):
-    """Сравнение кривых сходимости GA и FGA."""
-    fig = go.Figure()
-    for hist, lbl, clr in [
-        (hist_ga,  "GA  (фиксированная мутация)", "#89b4fa"),
-        (hist_fga, "FGA (нечёткая мутация)",       "#f38ba8"),
-    ]:
-        fig.add_trace(go.Scatter(
-            x=list(range(1, len(hist)+1)), y=hist,
-            mode="lines+markers", name=lbl,
-            line=dict(color=clr, width=2), marker=dict(size=5),
-        ))
-    fig.update_layout(
-        **_PL, height=320, title_text="GA vs FGA: сходимость",
-        xaxis=dict(title="Поколение", **_AX),
-        yaxis=dict(title="RMSE (train)", type="log", **_AX),
-        legend=dict(font=dict(color=_TEXT, size=11),
-                    bgcolor=_BG2, bordercolor=_GRID, borderwidth=1),
-    )
-    return fig
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SESSION STATE
+# Инициализация session_state
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INIT = {
-    "cfg_algo":      "GA",
-    "cfg_n_pop":     20,
-    "cfg_n_gen":     10,
-    "cfg_n_colloc":  400,
-    "cfg_seed":      42,
-    "cfg_exp_pops":  [5, 10, 20],
-    "cfg_exp_gens":  [3, 5, 10],
-    "mode":          None,
-    # одиночный запуск
-    "best_model":    None,
-    "best_params":   None,
-    "best_split":    None,
-    "best_rmse_tr":  None,
-    "best_rmse_te":  None,
-    "ga_history":    [],
-    "ga_elapsed":    0.0,
-    "fuzzy_log":     None,
-    # сравнение GA vs FGA
-    "cmp_done":      False,
-    "cmp_ga":        None,   # (rmse_tr, rmse_te, history, elapsed)
-    "cmp_fga":       None,
-    # эксперимент
-    "exp_df":        None,
-    "exp_histories": {},
+defaults = {
+    'results':      None,
+    'ga_history':   None,
+    'plots':        {},
+    'run_complete': False,
 }
-for _k, _v in _INIT.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-
-def clear_results():
-    for k in ("mode", "best_model", "best_params", "best_split",
-              "best_rmse_tr", "best_rmse_te", "ga_history", "ga_elapsed",
-              "fuzzy_log", "cmp_done", "cmp_ga", "cmp_fga",
-              "exp_df", "exp_histories"):
-        st.session_state[k] = _INIT[k]
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SIDEBAR
+# SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## ⚙️ Параметры")
+    st.markdown('## ⚙️ Настройки')
 
-    st.radio("Алгоритм", ["GA", "FGA", "GA vs FGA"],
-             key="cfg_algo", on_change=clear_results,
-             help="GA — обычный, FGA — нечёткая мутация, GA vs FGA — сравнение")
-
-    st.slider("Размер популяции", 5, 50, step=5,
-              key="cfg_n_pop", on_change=clear_results)
-    st.slider("Число поколений",  3, 30, step=1,
-              key="cfg_n_gen", on_change=clear_results)
-    st.selectbox("Коллокационных точек",
-                 options=[100, 225, 400, 625, 900],
-                 key="cfg_n_colloc", on_change=clear_results)
-    st.number_input("Seed", min_value=0, step=1,
-                    key="cfg_seed", on_change=clear_results)
-
-    st.divider()
-    st.markdown("**Эксперимент**")
-    st.multiselect("Популяции",  [5, 10, 15, 20, 30, 50],
-                   key="cfg_exp_pops", on_change=clear_results)
-    st.multiselect("Поколения",  [3, 5, 10, 15, 20],
-                   key="cfg_exp_gens", on_change=clear_results)
-
-    btn_single = st.button("▶ Запустить",              type="primary")
-    btn_exp    = st.button("🔬 Запустить эксперимент")
-
-    st.divider()
-    st.markdown("**Параметры модели**")
-    sidebar_ph = st.empty()
-
-    def render_sidebar(params=None, rmse_tr=None, rmse_te=None):
-        with sidebar_ph.container():
-            if params is None:
-                st.caption("— нет данных —")
-                return
-            c1, c2 = st.columns(2)
-            c1.metric("Нейронов",  params["n_hidden"])
-            c2.metric("Активация", params["activation"])
-            c3, c4 = st.columns(2)
-            c3.metric("σ",     f"{params['scale']:.2f}")
-            c4.metric("λ_pde", f"{params['lambda_pde']:.4f}")
-            c5, c6 = st.columns(2)
-            c5.metric("λ_bc",  f"{params['lambda_bc']:.2f}")
-            c6.metric("",      "")
-            if rmse_tr is not None:
-                st.metric("RMSE train", f"{rmse_tr:.3e}")
-            if rmse_te is not None:
-                st.metric("RMSE test",  f"{rmse_te:.3e}")
-
-    render_sidebar(
-        st.session_state.best_params,
-        st.session_state.best_rmse_tr,
-        st.session_state.best_rmse_te,
+    # ── Блок 1: Выбор уравнения ───────────────────────────────────────────
+    st.markdown('### 📐 Уравнение')
+    equation_name = st.selectbox(
+        'Уравнение',
+        options=[
+            'Уравнение Пуассона (стационарное)',
+            'Уравнение пьезопроводности (нестационарное)',
+        ],
+        help=(
+            'Пуассон: ∇²P = f(x,y) — стационарная фильтрация\n\n'
+            'Пьезопроводность: ∂P/∂t = κ·∇²P + q — нестационарная фильтрация'
+        ),
     )
+    is_piezo = 'пьезо' in equation_name.lower()
+    dim      = 3 if is_piezo else 2
 
-    st.divider()
-    st.markdown("**Уравнение Дарси**")
-    for eq in ["∇²P = 0", "u = −(k/μ) ∇P",
-               "P(0,y)=1,  P(1,y)=0",
-               "∂P/∂n = 0  (top/bot)",
-               "Точное:  P = 1 − x"]:
-        st.code(eq, language=None)
+    st.markdown('---')
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ШАПКА
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── Блок 2: Параметры уравнения ───────────────────────────────────────
+    st.markdown('### 📊 Параметры уравнения')
 
-algo_label = st.session_state.cfg_algo
-st.title(f"🌊 {algo_label}-PIELM · Фильтрация Дарси")
-st.caption("Физически информированная ELM  ·  Разбивка 75/25  ·  "
-           "Нечёткий ГА по: Herrera & Lozano (1995)")
-st.divider()
+    source_variants = PIEZO_SOURCE_VARIANTS if is_piezo else POISSON_SOURCE_VARIANTS
+    source_name     = st.selectbox('Источниковый член f(x,y)',
+                                   options=list(source_variants.keys()))
+    source_info     = source_variants[source_name]
+    source_func     = source_info['func']
+    source_params   = {}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ДАННЫЕ
-# ─────────────────────────────────────────────────────────────────────────────
+    st.markdown('**Параметры источника:**')
+    for param, default_val in source_info['params'].items():
+        lo, hi = source_info['param_ranges'][param]
+        source_params[param] = st.slider(
+            param, min_value=float(lo), max_value=float(hi),
+            value=float(default_val), step=(hi - lo) / 100,
+        )
 
-Xf_all        = make_colloc(st.session_state.cfg_n_colloc)
-Xb, Yb        = make_bc()
-xx, yy, Xgrid = make_grid()
-main          = st.empty()
+    if is_piezo:
+        st.markdown('**Параметры пьезопроводности:**')
+        kappa = st.number_input(
+            'κ — коэффициент пьезопроводности',
+            min_value=0.01, max_value=10.0, value=1.0, step=0.01,
+            help='κ = k/(m·μ)·(1/Kρ + 1/Km)⁻¹  (Леонтьев §12, формула 12.2)',
+        )
+        T_end = st.number_input(
+            'T — конечное время',
+            min_value=0.1, max_value=10.0, value=1.0, step=0.1,
+        )
+    else:
+        kappa = None
+        T_end = None
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  РЕНДЕР: одиночный запуск (GA или FGA)
-# ─────────────────────────────────────────────────────────────────────────────
+    st.markdown('---')
 
-def show_single():
-    model      = st.session_state.best_model
-    params     = st.session_state.best_params
-    X_train, X_test = st.session_state.best_split
-    rmse_tr    = st.session_state.best_rmse_tr
-    rmse_te    = st.session_state.best_rmse_te
-    history    = st.session_state.ga_history
-    elapsed    = st.session_state.ga_elapsed
-    fuzzy_log  = st.session_state.fuzzy_log
-    is_fga     = (st.session_state.cfg_algo == "FGA")
-    if model is None:
-        return
+    # ── Блок 3: Коллокационные точки ─────────────────────────────────────
+    st.markdown('### 🔢 Коллокационные точки')
 
-    with main.container():
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("RMSE train",  f"{rmse_tr:.2e}")
-        c2.metric("RMSE test",   f"{rmse_te:.2e}")
-        c3.metric("Нейронов",    str(params["n_hidden"]))
-        c4.metric("Активация",   params["activation"])
-        c5.metric("Время",       f"{elapsed:.1f} с")
+    strategies = (SAMPLING_STRATEGIES_3D if is_piezo
+                  else SAMPLING_STRATEGIES_2D)
+    sampling   = st.selectbox('Стратегия размещения',
+                              options=list(strategies.keys()))
 
-        with st.expander("Все гиперпараметры", expanded=False):
-            st.dataframe(pd.DataFrame([{
-                "N":          params["n_hidden"],
-                "act":        params["activation"],
-                "σ":          round(params["scale"],      3),
-                "λ_pde":      round(params["lambda_pde"], 4),
-                "λ_bc":       round(params["lambda_bc"],  3),
-                "RMSE train": f"{rmse_tr:.3e}",
-                "RMSE test":  f"{rmse_te:.3e}",
-            }]), hide_index=True)
+    n_colloc = st.slider(
+        'Число точек N (для сетки — N×N)',
+        min_value=5, max_value=50, value=15,
+        help='Для сетки: N² внутренних точек. Для случайной: N точек.',
+    )
+    n_actual = count_points(sampling, n_colloc, dim=dim)
+    st.caption(f'Фактическое число точек: **{n_actual}**')
 
-        st.divider()
+    n_bc = st.slider('Граничных точек на сторону',
+                     min_value=10, max_value=60, value=30)
 
-        # Вкладки зависят от режима
-        tabs = ["📊 Графики", "🧪 Train / Test"]
-        if is_fga and fuzzy_log:
-            tabs.append("🔮 Нечёткий контроллер")
-        tab_objs = st.tabs(tabs)
+    st.markdown('---')
 
-        with tab_objs[0]:
-            st.plotly_chart(chart_pressure(model, xx, yy, Xgrid), width="stretch")
-            col_v, col_p = st.columns(2)
-            with col_v:
-                st.plotly_chart(chart_velocity(model, xx, yy, Xgrid), width="stretch")
-            with col_p:
-                st.plotly_chart(chart_profiles(model), width="stretch")
-            if history:
-                lbl = "FGA" if is_fga else "GA"
-                st.plotly_chart(chart_convergence({lbl: history}), width="stretch")
+    # ── Блок 4: Гиперпараметры PIELM ─────────────────────────────────────
+    st.markdown('### 🧠 Гиперпараметры PIELM')
 
-        with tab_objs[1]:
-            st.markdown("### Оценка на тестовой выборке (25%)")
-            st.caption("Тестовые точки не использовались в обучении и поиске.")
-            ca, cb_, cc, cd = st.columns(4)
-            ca.metric("RMSE train",  f"{rmse_tr:.3e}")
-            cb_.metric("RMSE test",  f"{rmse_te:.3e}")
-            cc.metric("Train точек", len(X_train))
-            cd.metric("Test точек",  len(X_test))
-            st.plotly_chart(chart_test_scatter(X_train, X_test, model), width="stretch")
-            err_tr = np.abs(model.predict(X_train).ravel()
-                            - p_exact(X_train[:, 0], X_train[:, 1]))
-            err_te = np.abs(model.predict(X_test).ravel()
-                            - p_exact(X_test[:, 0],  X_test[:, 1]))
-            st.dataframe(pd.DataFrame({
-                "Выборка":      ["Train (75%)", "Test (25%)"],
-                "Точек":        [len(X_train),  len(X_test)],
-                "RMSE":         [f"{rmse_tr:.3e}", f"{rmse_te:.3e}"],
-                "Макс ошибка":  [f"{err_tr.max():.3e}", f"{err_te.max():.3e}"],
-                "Средн ошибка": [f"{err_tr.mean():.3e}", f"{err_te.mean():.3e}"],
-            }), hide_index=True)
+    mode   = st.radio('Режим настройки',
+                      options=['Ручной', 'Автоматический (GA)'],
+                      horizontal=True)
+    use_ga = mode == 'Автоматический (GA)'
 
-        if is_fga and fuzzy_log and len(tab_objs) > 2:
-            with tab_objs[2]:
-                st.markdown("### Работа нечёткого контроллера мутации")
-                st.caption(
-                    "**e₁** — разнообразие популяции: (f_ave − f_min) / f_ave.  "
-                    "**e₂** — скорость улучшения: (f_ave(t−1) − f_ave(t)) / f_ave(t−1).  "
-                    "Оба нормированы в [0, 1]. Контроллер увеличивает мутацию, "
-                    "когда популяция однородна или застряла."
-                )
-                st.plotly_chart(chart_fuzzy_log(fuzzy_log), width="stretch")
-                st.dataframe(
-                    pd.DataFrame(fuzzy_log).rename(columns={
-                        "gen": "Поколение", "e1": "e₁", "e2": "e₂", "p_mut": "p_mut"
-                    }).assign(**{"Поколение": lambda d: d["Поколение"] + 1})
-                    .style.format({"e₁": "{:.3f}", "e₂": "{:.3f}", "p_mut": "{:.3f}"}),
-                    hide_index=True,
-                )
+    if use_ga:
+        st.markdown('**Параметры генетического алгоритма:**')
+        n_pop    = st.slider('Размер популяции',     10, 50, 20)
+        n_gen    = st.slider('Число поколений',       5, 30, 10)
+        elite_f  = st.slider('Доля элиты',          0.1, 0.4, 0.2, step=0.05)
+        mut_prob = st.slider('Вероятность мутации', 0.1, 0.5, 0.3, step=0.05)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  РЕНДЕР: сравнение GA vs FGA
-# ─────────────────────────────────────────────────────────────────────────────
+        st.markdown('**Границы поиска:**')
+        h_min, h_max = st.slider('n_hidden (диапазон)', 50, 600, (50, 400))
+        s_min, s_max = st.slider('scale (диапазон)',    0.5, 15.0, (0.5, 10.0))
 
-def show_compare():
-    if not st.session_state.cmp_done:
-        return
-    ga  = st.session_state.cmp_ga   # (rmse_tr, rmse_te, history, elapsed, bp, model, Xtr, Xte)
-    fga = st.session_state.cmp_fga
-    fl  = st.session_state.fuzzy_log
+        manual_params = None
+        ga_params_cfg = {
+            'n_pop':         n_pop,
+            'n_gen':         n_gen,
+            'elite_frac':    elite_f,
+            'mut_prob':      mut_prob,
+            'hidden_bounds': (h_min, h_max),
+            'scale_bounds':  (s_min, s_max),
+        }
+    else:
+        st.markdown('**Параметры PIELM:**')
+        n_hidden   = st.slider('n_hidden',    50, 600, 200)
+        scale      = st.slider('scale',       0.5, 15.0, 5.0, step=0.5)
+        activation = st.selectbox('Функция активации',
+                                  options=['tanh', 'sin', 'sigmoid'])
+        lam_pde    = st.slider('λ_pde', 0.01, 10.0, 1.0, step=0.01)
+        lam_bc     = st.slider('λ_bc',  1.0, 100.0, 10.0, step=1.0)
 
-    with main.container():
-        st.markdown("### Сравнение GA и FGA")
+        manual_params = {
+            'n_hidden':   n_hidden,
+            'scale':      scale,
+            'activation': activation,
+            'lambda_pde': lam_pde,
+            'lambda_bc':  lam_bc,
+        }
+        ga_params_cfg = None
 
-        # Сводная таблица
-        df_cmp = pd.DataFrame([
-            {"Алгоритм": "GA",  "RMSE train": f"{ga[0]:.3e}",
-             "RMSE test": f"{ga[1]:.3e}",  "Время, с": f"{ga[3]:.1f}",
-             "Нейронов": ga[4]["n_hidden"], "Активация": ga[4]["activation"]},
-            {"Алгоритм": "FGA", "RMSE train": f"{fga[0]:.3e}",
-             "RMSE test": f"{fga[1]:.3e}", "Время, с": f"{fga[3]:.1f}",
-             "Нейронов": fga[4]["n_hidden"], "Активация": fga[4]["activation"]},
-        ])
-        st.dataframe(df_cmp, hide_index=True)
+    st.markdown('---')
 
-        # Победитель
-        if ga[1] <= fga[1]:
-            winner_lbl, w_rte = "GA", ga[1]
+    # ── Блок 5: МКР ───────────────────────────────────────────────────────
+    st.markdown('### ⚖️ Метод конечных разностей')
+    fdm_enabled = st.toggle('Включить МКР для сравнения', value=True)
+
+    if fdm_enabled:
+        n_grid_fdm = st.slider('Узлов сетки МКР (n_grid)',
+                               10, 100, 50,
+                               help='Полная сетка: (n_grid+2)²')
+        if is_piezo:
+            n_t_fdm = st.slider('Временных шагов МКР', 20, 200, 50)
         else:
-            winner_lbl, w_rte = "FGA", fga[1]
-        st.success(
-            f"✅ Победитель по RMSE test: **{winner_lbl}**  ({w_rte:.3e})  "
-            f"— модель сохранена, графики доступны ниже."
+            n_t_fdm = None
+
+    st.markdown('---')
+
+    # ── Кнопка запуска ────────────────────────────────────────────────────
+    run_btn = st.button('▶ Запустить вычисление',
+                        type='primary', use_container_width=True)
+
+    st.markdown('---')
+    st.caption('💾 Экспорт доступен после вычисления')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ОСНОВНАЯ ОБЛАСТЬ — ВЫЧИСЛЕНИЕ
+# ─────────────────────────────────────────────────────────────────────────────
+
+if run_btn:
+    st.session_state['run_complete'] = False
+    st.session_state['plots']        = {}
+
+    with st.spinner('Подготовка данных...'):
+
+        # ── Генерация коллокационных точек ───────────────────────────────
+        X_all = make_collocation_points(
+            sampling, n_colloc, dim=dim,
+            T=T_end if is_piezo else 1.0,
+            seed=42,
         )
+        X_train, X_test = train_test_split(X_all, test_size=0.25, seed=42)
 
-        st.divider()
+        if is_piezo:
+            X_b, Y_b = boundary_conditions_piezo(n_bc=n_bc, n_t=20, T=T_end)
+        else:
+            X_b, Y_b = boundary_conditions_poisson(n_bc=n_bc)
 
-        # Графики сравнения
-        col_l, col_r = st.columns(2)
-        with col_l:
-            st.plotly_chart(chart_ga_fga_compare(ga[2], fga[2]), width="stretch")
-        with col_r:
-            if fl:
-                st.plotly_chart(chart_fuzzy_log(fl), width="stretch")
-
-        # Графики победившей модели
-        st.divider()
-        st.markdown(f"#### Поле давления — модель **{winner_lbl}**")
-        w_model = st.session_state.best_model
-        if w_model is not None:
-            st.plotly_chart(chart_pressure(w_model, xx, yy, Xgrid), width="stretch")
-            col_v, col_p = st.columns(2)
-            with col_v:
-                st.plotly_chart(chart_velocity(w_model, xx, yy, Xgrid), width="stretch")
-            with col_p:
-                st.plotly_chart(chart_profiles(w_model), width="stretch")
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  РЕНДЕР: эксперимент
-# ─────────────────────────────────────────────────────────────────────────────
-
-def show_experiment():
-    df    = st.session_state.exp_df
-    hists = st.session_state.exp_histories
-    if df is None:
-        return
-
-    bi      = df["RMSE test"].idxmin()
-    w_pop   = df.loc[bi, "Популяция"]
-    w_gen   = df.loc[bi, "Поколения"]
-    w_algo  = df.loc[bi, "Алгоритм"]
-    w_rte   = df.loc[bi, "RMSE test"]
-    w_n     = df.loc[bi, "Нейронов"]
-    w_act   = df.loc[bi, "Активация"]
-
-    with main.container():
-        st.success(
-            f"✅ Победитель: **{w_algo}**  ·  pop={w_pop}  gen={w_gen}  "
-            f"·  RMSE test={w_rte:.3e}  ·  N={w_n}  act={w_act}"
-        )
-
-        df_fmt = df.copy()
-        df_fmt["RMSE train"] = df_fmt["RMSE train"].map(lambda v: f"{v:.3e}")
-        df_fmt["RMSE test"]  = df_fmt["RMSE test"].map(lambda v: f"{v:.3e}")
-        st.dataframe(df_fmt, hide_index=True)
-
-        st.divider()
-        col_h, col_c = st.columns(2)
-        with col_h:
-            st.plotly_chart(chart_heatmap(df), width="stretch")
-        with col_c:
-            if hists:
-                st.plotly_chart(chart_convergence(hists), width="stretch")
-
-        # Графики победившей модели
-        w_model = st.session_state.best_model
-        if w_model is not None:
-            st.divider()
-            st.markdown(f"#### Поле давления — лучшая модель (pop={w_pop}, gen={w_gen})")
-            st.plotly_chart(chart_pressure(w_model, xx, yy, Xgrid), width="stretch")
-            col_v, col_p = st.columns(2)
-            with col_v:
-                st.plotly_chart(chart_velocity(w_model, xx, yy, Xgrid), width="stretch")
-            with col_p:
-                st.plotly_chart(chart_profiles(w_model), width="stretch")
-
-        st.download_button(
-            "⬇ Скачать CSV",
-            data=df.to_csv(index=False).encode(),
-            file_name="ga_pielm_results.csv",
-            mime="text/csv",
-        )
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ЗАПУСК
-# ─────────────────────────────────────────────────────────────────────────────
-
-if btn_single:
-    clear_results()
-    algo = st.session_state.cfg_algo
-
-    # ── GA vs FGA: запускаем оба последовательно ─────────────────────────────
-    if algo == "GA vs FGA":
-        st.session_state.mode = "compare"
-        results = {}
-        flog    = None
-
-        with main.container():
-            for label, use_fz in [("GA", False), ("FGA", True)]:
-                st.markdown(f"#### ⏳ {label} — оптимизация")
-                prog   = st.progress(0)
-                status = st.empty()
-
-                def _cb(gen, total, loss, params, _lbl=label):
-                    prog.progress(gen / total)
-                    status.markdown(
-                        f"**{_lbl}** · Поколение **{gen}/{total}**  ·  "
-                        f"RMSE `{loss:.3e}`  ·  N={params['n_hidden']}"
-                    )
-
-                t0 = time.time()
-                m, bp, hist, Xtr, Xte, rtr, rte, fl = run_optimizer(
-                    Xf_all, Xb, Yb,
-                    n_pop=st.session_state.cfg_n_pop,
-                    n_gen=st.session_state.cfg_n_gen,
-                    seed=int(st.session_state.cfg_seed),
-                    use_fuzzy=use_fz, cb=_cb,
+        # ── Замыкания оператора и источника ──────────────────────────────
+        if is_piezo:
+            def operator(W, b, X, act_name, act_dict):
+                return pde_operator_piezo(
+                    W, b, X, kappa=kappa,
+                    act_name=act_name, act_dict=act_dict,
                 )
-                elapsed = time.time() - t0
-                prog.progress(1.0)
-                status.success(f"✅ {label} завершён")
-
-                results[label] = (rtr, rte, hist, elapsed, bp, m, Xtr, Xte)
-                if use_fz:
-                    flog = fl
-
-        st.session_state.cmp_ga    = results["GA"]
-        st.session_state.cmp_fga   = results["FGA"]
-        st.session_state.fuzzy_log = flog
-        st.session_state.cmp_done  = True
-
-        # Победитель по RMSE test → сохраняем как основную модель
-        ga_rte  = results["GA"][1]
-        fga_rte = results["FGA"][1]
-        winner  = results["GA"] if ga_rte <= fga_rte else results["FGA"]
-        w_rtr, w_rte, _, w_elapsed, w_bp, w_model, w_Xtr, w_Xte = winner
-
-        st.session_state.best_model  = w_model
-        st.session_state.best_params = w_bp
-        st.session_state.best_split  = (w_Xtr, w_Xte)
-        st.session_state.best_rmse_tr = w_rtr
-        st.session_state.best_rmse_te = w_rte
-        st.session_state.ga_elapsed   = w_elapsed
-        render_sidebar(w_bp, w_rtr, w_rte)
-        show_compare()
-
-    # ── Одиночный GA или FGA ─────────────────────────────────────────────────
-    else:
-        st.session_state.mode = "single"
-        use_fz = (algo == "FGA")
-
-        with main.container():
-            st.markdown(f"#### ⏳ {algo} — оптимизация гиперпараметров")
-            prog   = st.progress(0)
-            status = st.empty()
-            log_ph = st.empty()
-            log    = []
-
-            def _cb(gen, total, loss, params):
-                prog.progress(gen / total)
-                status.markdown(
-                    f"Поколение **{gen}/{total}**  ·  "
-                    f"RMSE `{loss:.3e}`  ·  "
-                    f"N={params['n_hidden']}  ·  act={params['activation']}"
+            def source_fn(X):
+                return rhs_piezo(X, source_func, source_params)
+        else:
+            def operator(W, b, X, act_name, act_dict):
+                return pde_operator_poisson(
+                    W, b, X,
+                    act_name=act_name, act_dict=act_dict,
                 )
-                log.append(
-                    f"[{gen:02d}/{total}]  RMSE={loss:.3e}  "
-                    f"N={params['n_hidden']:4d}  {params['activation']:8s}  "
-                    f"σ={params['scale']:.2f}  "
-                    f"λp={params['lambda_pde']:.3f}  λb={params['lambda_bc']:.2f}"
-                )
-                log_ph.code("\n".join(log[-8:]))
-                render_sidebar(params, rmse_tr=loss)
+            def source_fn(X):
+                return rhs_poisson(X, source_func, source_params)
 
-            t0 = time.time()
-            model, best_p, history, X_train, X_test, rmse_tr, rmse_te, fuzzy_log = \
-                run_optimizer(
-                    Xf_all, Xb, Yb,
-                    n_pop=st.session_state.cfg_n_pop,
-                    n_gen=st.session_state.cfg_n_gen,
-                    seed=int(st.session_state.cfg_seed),
-                    use_fuzzy=use_fz, cb=_cb,
-                )
-            elapsed = time.time() - t0
-            prog.progress(1.0)
-            status.success("✅ Оптимизация завершена")
+    # ── Режим GA ─────────────────────────────────────────────────────────
+    if use_ga:
+        st.markdown('<div class="section-header">🧬 Генетическая оптимизация</div>',
+                    unsafe_allow_html=True)
 
-        st.session_state.best_model  = model
-        st.session_state.best_params = best_p
-        st.session_state.best_split  = (X_train, X_test)
-        st.session_state.best_rmse_tr= rmse_tr
-        st.session_state.best_rmse_te= rmse_te
-        st.session_state.ga_history  = history
-        st.session_state.ga_elapsed  = elapsed
-        st.session_state.fuzzy_log   = fuzzy_log
+        progress_bar      = st.progress(0)
+        status_text       = st.empty()
+        chart_placeholder = st.empty()
 
-        render_sidebar(best_p, rmse_tr, rmse_te)
-        show_single()
+        ga_gen_list  = []
+        ga_best_list = []
+        ga_cur_list  = []
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ЗАПУСК — эксперимент
-# ─────────────────────────────────────────────────────────────────────────────
-
-elif btn_exp and st.session_state.cfg_exp_pops and st.session_state.cfg_exp_gens:
-    clear_results()
-    st.session_state.mode = "experiment"
-    algo_lbl = st.session_state.cfg_algo
-    is_compare = (algo_lbl == "GA vs FGA")
-    use_fz = (algo_lbl == "FGA")
-
-    combos = [(p, g)
-              for p in sorted(st.session_state.cfg_exp_pops)
-              for g in sorted(st.session_state.cfg_exp_gens)]
-
-    with main.container():
-        st.markdown(f"#### ⏳ {algo_lbl} — сравнительный эксперимент")
-        prog = st.progress(0)
-        info = st.empty()
-        tbl  = st.empty()
-
-        rows       = {}
-        hists      = {}
-        models_map = {}
-
-        for i, (n_p, n_g) in enumerate(combos):
-            label = f"pop={n_p} · gen={n_g}"
-            info.markdown(f"⏳ **{label}**  ({i+1}/{len(combos)})")
-            seed = int(st.session_state.cfg_seed)
-
-            if is_compare:
-                # Запускаем GA и FGA раздельно, замеряем время каждого
-                results_pair = {}
-                for lbl_pair, fz in [("GA", False), ("FGA", True)]:
-                    t0_ = time.time()
-                    m_, p_, h_, Xtr_, Xte_, rtr_, rte_, _ = run_optimizer(
-                        Xf_all, Xb, Yb, n_p, n_g, seed=seed, use_fuzzy=fz)
-                    results_pair[lbl_pair] = (m_, p_, h_, Xtr_, Xte_, rtr_, rte_,
-                                              time.time() - t0_)
-
-                ga_r  = results_pair["GA"]
-                fga_r = results_pair["FGA"]
-                if ga_r[6] <= fga_r[6]:
-                    winner_lbl, m, p, h, Xtr, Xte, rtr, rte, elapsed = "GA",  *ga_r
-                else:
-                    winner_lbl, m, p, h, Xtr, Xte, rtr, rte, elapsed = "FGA", *fga_r
-                hists[f"GA  pop={n_p} gen={n_g}"]  = ga_r[2]
-                hists[f"FGA pop={n_p} gen={n_g}"]  = fga_r[2]
-            else:
-                t0 = time.time()
-                m, p, h, Xtr, Xte, rtr, rte, _ = run_optimizer(
-                    Xf_all, Xb, Yb, n_p, n_g, seed=seed, use_fuzzy=use_fz)
-                elapsed  = time.time() - t0
-                winner_lbl = algo_lbl
-                hists[label] = h
-
-            rows[(n_p, n_g)] = {
-                "Алгоритм":   winner_lbl,
-                "Популяция":  n_p,
-                "Поколения":  n_g,
-                "Оценок":     n_p * n_g,
-                "RMSE train": rtr,
-                "RMSE test":  rte,
-                "Нейронов":   p["n_hidden"],
-                "Активация":  p["activation"],
-                "λ_pde":      round(p["lambda_pde"], 4),
-                "λ_bc":       round(p["lambda_bc"],  2),
-                "Время, с":   round(elapsed, 2),
-            }
-            models_map[(n_p, n_g)] = (m, Xtr, Xte, rtr, rte, p)
-            prog.progress((i+1) / len(combos))
-
-            df_live = pd.DataFrame(list(rows.values())).copy()
-            df_live["RMSE train"] = df_live["RMSE train"].map(lambda v: f"{v:.3e}")
-            df_live["RMSE test"]  = df_live["RMSE test"].map(lambda v: f"{v:.3e}")
-            tbl.dataframe(df_live, hide_index=True)
-
-            best_key = min(rows, key=lambda k: rows[k]["RMSE test"])
-            bm = models_map[best_key]
-            render_sidebar(bm[5], bm[3], bm[4])
-
-        info.success("✅ Эксперимент завершён")
-
-    # Победитель по RMSE test → сохраняем модель
-    best_key = min(rows, key=lambda k: rows[k]["RMSE test"])
-    bm = models_map[best_key]
-    w_model, w_Xtr, w_Xte, w_rtr, w_rte, w_bp = bm
-    st.session_state.best_model   = w_model
-    st.session_state.best_params  = w_bp
-    st.session_state.best_split   = (w_Xtr, w_Xte)
-    st.session_state.best_rmse_tr = w_rtr
-    st.session_state.best_rmse_te = w_rte
-    st.session_state.exp_df        = pd.DataFrame(list(rows.values()))
-    st.session_state.exp_histories = hists
-    render_sidebar(w_bp, w_rtr, w_rte)
-    show_experiment()
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ПОВТОРНЫЙ РЕНДЕР
-# ─────────────────────────────────────────────────────────────────────────────
-
-else:
-    mode = st.session_state.mode
-    if mode == "single" and st.session_state.best_model is not None:
-        show_single()
-    elif mode == "compare" and st.session_state.cmp_done:
-        show_compare()
-    elif mode == "experiment" and st.session_state.exp_df is not None:
-        show_experiment()
-    else:
-        with main.container():
-            st.info(
-                "Выберите алгоритм (GA / FGA / GA vs FGA) в боковой панели  "
-                "и нажмите **▶ Запустить**."
+        def ga_callback(gen, best_rmse, best_params):
+            progress_bar.progress(int(gen / n_gen * 100))
+            status_text.markdown(
+                f'Поколение **{gen}/{n_gen}** — '
+                f'RMSE невязки: **{best_rmse:.6f}** — '
+                f'n_hidden: **{best_params["n_hidden"]}**, '
+                f'activation: **{best_params["activation"]}**'
             )
+            ga_gen_list.append(gen)
+            ga_best_list.append(best_rmse)
+            ga_cur_list.append(best_rmse)
+            if gen % max(1, n_gen // 10) == 0:
+                png = plot_ga_progress(ga_gen_list, ga_best_list, ga_cur_list)
+                chart_placeholder.image(png, use_container_width=True)
+
+        ga = GeneticOptimizer(
+            n_pop         = ga_params_cfg['n_pop'],
+            n_gen         = ga_params_cfg['n_gen'],
+            hidden_bounds = ga_params_cfg['hidden_bounds'],
+            scale_bounds  = ga_params_cfg['scale_bounds'],
+            elite_frac    = ga_params_cfg['elite_frac'],
+            mut_prob      = ga_params_cfg['mut_prob'],
+        )
+
+        t0 = time.time()
+        best_hp = ga.search(
+            X_train, X_b, Y_b,
+            operator_func = operator,
+            source_func   = source_fn,
+            input_dim     = dim,
+            callback      = ga_callback,
+        )
+        t_ga = time.time() - t0
+
+        progress_bar.progress(100)
+        status_text.success(f'✅ GA завершён за {t_ga:.1f} с')
+
+        gens, best_rmse_hist, gen_rmse_hist = ga.get_history_arrays()
+        png_ga = plot_ga_progress(gens, best_rmse_hist, gen_rmse_hist)
+        chart_placeholder.image(png_ga, use_container_width=True)
+        st.session_state['plots']['ga_progress.png'] = png_ga
+        st.session_state['ga_history'] = ga.history
+
+        # Переобучаем лучшую модель отдельно — замеряем чистое время fit
+        with st.spinner('Обучение лучшей модели...'):
+            best_model = PIELM(
+                n_hidden   = best_hp['n_hidden'],
+                input_dim  = dim,
+                scale      = best_hp['scale'],
+                act_name   = best_hp['activation'],
+                lambda_pde = best_hp['lambda_pde'],
+                lambda_bc  = best_hp['lambda_bc'],
+                seed       = 0,
+            )
+            t0 = time.time()
+            best_model.fit(X_train, X_b, Y_b, operator, source_fn)
+            t_fit = time.time() - t0
+        t_pielm = t_ga + t_fit
+
+    # ── Ручной режим ─────────────────────────────────────────────────────
+    else:
+        best_hp = manual_params
+        st.session_state['ga_history'] = None
+
+        with st.spinner('Обучение PIELM...'):
+            best_model = PIELM(
+                n_hidden   = manual_params['n_hidden'],
+                input_dim  = dim,
+                scale      = manual_params['scale'],
+                act_name   = manual_params['activation'],
+                lambda_pde = manual_params['lambda_pde'],
+                lambda_bc  = manual_params['lambda_bc'],
+                seed       = 0,
+            )
+            t0 = time.time()
+            best_model.fit(X_train, X_b, Y_b, operator, source_fn)
+            t_pielm = time.time() - t0
+        t_ga  = None
+        t_fit = t_pielm
+
+    # ── Метрики PIELM ────────────────────────────────────────────────────
+    # rmse_pde_train — невязка L[P]−f на точках построения МНК (X_train)
+    # rmse_pde_test  — невязка L[P]−f на точках вне МНК (X_test)
+    # Разница показывает равномерность аппроксимации по области Ω,
+    # а не переобучение — в PIELM β находится из линейной задачи МНК,
+    # классического переобучения здесь нет
+    rmse_pde_train = best_model.rmse_pde(X_train, operator, source_fn)
+    rmse_pde_test  = best_model.rmse_pde(X_test,  operator, source_fn)
+
+    # t_ga   — время работы генетического алгоритма (только GA-режим)
+    # t_fit  — время обучения лучшей модели (МНК, fit)
+    # t_pielm — суммарное время (GA + fit) или просто fit в ручном режиме
+    pielm_metrics = {
+        'rmse_pde_train': rmse_pde_train,
+        'rmse_pde_test':  rmse_pde_test,
+        'time':           t_pielm,
+        't_ga':           t_ga   if use_ga else None,
+        't_fit':          t_fit  if use_ga else t_pielm,
+    }
+
+    # ── МКР ──────────────────────────────────────────────────────────────
+    fdm_metrics = None
+    fdm_solver  = None
+
+    if fdm_enabled:
+        with st.spinner('Вычисление МКР...'):
+            if is_piezo:
+                fdm_solver = FDMPiezo(
+                    n_grid=n_grid_fdm, n_t=n_t_fdm,
+                    T=T_end, kappa=kappa,
+                )
+                t0 = time.time()
+                fdm_solver.solve(source_func, source_params)
+                t_fdm = time.time() - t0
+            else:
+                fdm_solver = FDMPoisson(n_grid=n_grid_fdm)
+                t0 = time.time()
+                fdm_solver.solve(source_func, source_params)
+                t_fdm = time.time() - t0
+
+            # Расхождение решений PIELM и МКР на тестовых точках
+            P_pielm_test      = best_model.predict(X_test)
+            P_fdm_test        = fdm_solver.predict(X_test)
+            rmse_pielm_vs_fdm = float(np.sqrt(
+                np.mean((P_pielm_test - P_fdm_test) ** 2)
+            ))
+            fdm_metrics = {
+                'rmse':   rmse_pielm_vs_fdm,
+                'time':   t_fdm,
+                'n_grid': n_grid_fdm,
+            }
+
+    # ── Сохраняем в session_state ─────────────────────────────────────────
+    st.session_state['results'] = {
+        'model':         best_model,
+        'fdm_solver':    fdm_solver,
+        'X_train':       X_train,
+        'X_test':        X_test,
+        'X_b':           X_b,
+        'Y_b':           Y_b,
+        'best_hp':       best_hp,
+        'pielm_metrics': pielm_metrics,
+        'fdm_metrics':   fdm_metrics,
+        'fdm_enabled':   fdm_enabled,
+        'is_piezo':      is_piezo,
+        'dim':           dim,
+        'kappa':         kappa,
+        'T_end':         T_end,
+        'source_func':   source_func,
+        'source_params': source_params,
+        'source_name':   source_name,
+        'equation_name': equation_name,
+        'sampling':      sampling,
+        'n_colloc':      n_colloc,
+        'n_bc':          n_bc,
+    }
+    st.session_state['run_complete'] = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ВЫВОД РЕЗУЛЬТАТОВ
+# ─────────────────────────────────────────────────────────────────────────────
+
+if st.session_state['run_complete'] and st.session_state['results'] is not None:
+    res = st.session_state['results']
+
+    model       = res['model']
+    fdm_solver  = res['fdm_solver']
+    is_piezo    = res['is_piezo']
+    dim         = res['dim']
+    kappa       = res['kappa']
+    T_end       = res['T_end']
+    source_func = res['source_func']
+    src_params  = res['source_params']
+    fdm_enabled = res['fdm_enabled']
+
+    pm = res['pielm_metrics']
+    fm = res['fdm_metrics']
+
+    tabs = st.tabs([
+        '📈 Прогресс GA',
+        '🔵 Коллокационные точки',
+        '🌊 Поле источника',
+        '🗺️ Результаты PIELM',
+        '⚖️ Сравнение методов',
+        '💾 Экспорт',
+    ])
+
+    # ── Вкладка 1: Прогресс GA ────────────────────────────────────────────
+    with tabs[0]:
+        st.markdown('<div class="section-header">Прогресс генетической оптимизации</div>',
+                    unsafe_allow_html=True)
+        if st.session_state['ga_history'] is not None:
+            hist = st.session_state['ga_history']
+            gens = [h['generation'] for h in hist]
+            best = [h['best_rmse']  for h in hist]
+            cur  = [h['gen_rmse']   for h in hist]
+            png  = plot_ga_progress(gens, best, cur)
+            st.image(png, use_container_width=True)
+            st.session_state['plots']['ga_progress.png'] = png
+
+            import pandas as pd
+            st.markdown('**История поколений:**')
+            df = pd.DataFrame(hist)[['generation', 'best_rmse', 'gen_rmse']]
+            df.columns = ['Поколение',
+                          'Лучший RMSE невязки (глоб.)',
+                          'RMSE невязки поколения']
+            st.dataframe(df.style.format({
+                'Лучший RMSE невязки (глоб.)': '{:.8f}',
+                'RMSE невязки поколения':      '{:.8f}',
+            }), use_container_width=True)
+        else:
+            st.info('GA не использовался. Переключитесь в режим '
+                    '"Автоматический (GA)" для просмотра прогресса.')
+
+    # ── Вкладка 2: Коллокационные точки ───────────────────────────────────
+    with tabs[1]:
+        st.markdown('<div class="section-header">Распределение коллокационных точек</div>',
+                    unsafe_allow_html=True)
+        png = plot_collocation_points(
+            res['X_train'], res['X_test'], res['X_b'], dim=dim
+        )
+        st.image(png, use_container_width=False)
+        st.session_state['plots']['collocation_points.png'] = png
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric('Train',    len(res['X_train']))
+        col2.metric('Test',     len(res['X_test']))
+        col3.metric('Граница',  len(res['X_b']))
+
+    # ── Вкладка 3: Поле источника ─────────────────────────────────────────
+    with tabs[2]:
+        st.markdown('<div class="section-header">Поле источникового члена</div>',
+                    unsafe_allow_html=True)
+
+        if is_piezo:
+            t_src = st.slider(
+                'Момент времени t для f(x,y,t)',
+                0.0, float(T_end), float(T_end) / 2,
+                step=float(T_end) / 20,
+                key='src_t_slider',
+            )
+            X_plot, xx, yy = get_grid_for_plot(n=80, dim=3,
+                                               T=T_end, t_slice=t_src)
+            F_vals = rhs_piezo(X_plot, source_func, src_params)
+        else:
+            X_plot, xx, yy = get_grid_for_plot(n=80, dim=2)
+            F_vals = rhs_poisson(X_plot, source_func, src_params)
+
+        png = plot_source_field(F_vals, xx, yy,
+                                title=f'Источник: {res["source_name"]}')
+        st.image(png, use_container_width=False)
+        st.session_state['plots']['source_field.png'] = png
+
+    # ── Вкладка 4: Результаты PIELM ───────────────────────────────────────
+    with tabs[3]:
+        st.markdown('<div class="section-header">Решение PIELM</div>',
+                    unsafe_allow_html=True)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric(
+            'RMSE невязки PDE (train)',
+            f'{pm["rmse_pde_train"]:.6f}',
+            help=(
+                'Невязка уравнения на точках построения МНК:\n'
+                '√mean((L[P] − f)²) на X_train'
+            ),
+        )
+        col2.metric(
+            'RMSE невязки PDE (test)',
+            f'{pm["rmse_pde_test"]:.6f}',
+            help=(
+                'Невязка уравнения на точках вне МНК:\n'
+                '√mean((L[P] − f)²) на X_test.\n'
+                'Показывает равномерность аппроксимации по области.'
+            ),
+        )
+        col3.metric('Суммарное время', f'{pm["time"]:.3f} с',
+                    help='GA + обучение лучшей модели (или только обучение в ручном режиме)')
+
+        if use_ga and pm['t_ga'] is not None:
+            c1, c2, c3 = st.columns(3)
+            c1.metric('Время GA (оптимизация)',      f'{pm["t_ga"]:.3f} с',
+                      help='Время работы генетического алгоритма')
+            c2.metric('Время обучения лучшей модели', f'{pm["t_fit"]:.3f} с',
+                      help='Чистое время решения МНК для лучших гиперпараметров')
+            c3.metric('Итого (GA + обучение)',         f'{pm["time"]:.3f} с')
+
+        import pandas as pd
+        st.markdown('**Лучшие гиперпараметры:**')
+        st.dataframe(
+            pd.DataFrame([res['best_hp']]).T.rename(columns={0: 'Значение'}),
+            use_container_width=False,
+        )
+
+        if is_piezo:
+            t_plot = st.slider(
+                'Момент времени t для визуализации',
+                0.0, float(T_end), float(T_end) / 2,
+                step=float(T_end) / 20,
+                key='result_t_slider',
+            )
+            X_plot, xx, yy = get_grid_for_plot(n=80, dim=3,
+                                               T=T_end, t_slice=t_plot)
+            P_pred = model.predict(X_plot)
+            png = plot_pielm_solution(
+                P_pred, xx, yy,
+                title=f'PIELM: P(x,y,t={t_plot:.2f})',
+            )
+        else:
+            X_plot, xx, yy = get_grid_for_plot(n=80, dim=2)
+            P_pred = model.predict(X_plot)
+            png = plot_pielm_solution(P_pred, xx, yy)
+
+        st.image(png, use_container_width=False)
+        st.session_state['plots']['pielm_solution.png'] = png
+
+        if is_piezo:
+            st.markdown('**Эволюция поля давления:**')
+            t_snaps = np.linspace(0.0, T_end, 4)[1:]
+            snaps   = []
+            for ts in t_snaps:
+                Xp, xx2, yy2 = get_grid_for_plot(n=60, dim=3,
+                                                  T=T_end, t_slice=ts)
+                snaps.append(model.predict(Xp))
+            png_ev = plot_piezo_evolution(snaps, xx2, yy2, list(t_snaps))
+            st.image(png_ev, use_container_width=True)
+            st.session_state['plots']['piezo_evolution.png'] = png_ev
+        else:
+            st.info('Эволюция доступна только для уравнения пьезопроводности.')
+
+    # ── Вкладка 5: Сравнение методов ──────────────────────────────────────
+    with tabs[4]:
+        st.markdown('<div class="section-header">Сравнение PIELM и МКР</div>',
+                    unsafe_allow_html=True)
+
+        if not fdm_enabled:
+            st.info('МКР отключён. Включите в боковой панели.')
+        else:
+            col1, col2 = st.columns(2)
+            col1.metric(
+                'RMSE невязки PDE (PIELM, test)',
+                f'{pm["rmse_pde_test"]:.6f}',
+                help='√mean((L[P] − f)²) на тестовых точках',
+            )
+            col2.metric(
+                'RMSE(PIELM vs МКР)',
+                f'{fm["rmse"]:.6f}',
+                help=(
+                    'Расхождение решений на тестовых точках:\n'
+                    '√mean((P_PIELM − P_МКР)²)\n'
+                    'Показывает согласованность методов.'
+                ),
+            )
+
+            # Временные метрики
+            st.markdown('**Время вычисления:**')
+            if use_ga and pm['t_ga'] is not None:
+                tc1, tc2, tc3, tc4 = st.columns(4)
+                tc1.metric('GA (оптимизация)',    f'{pm["t_ga"]:.3f} с',
+                           help='Время работы генетического алгоритма')
+                tc2.metric('Обучение лучшей модели', f'{pm["t_fit"]:.3f} с',
+                           help='Чистое время решения МНК')
+                tc3.metric('PIELM итого',         f'{pm["time"]:.3f} с',
+                           help='GA + обучение лучшей модели')
+                tc4.metric('МКР',                 f'{fm["time"]:.3f} с',
+                           help='Время решения методом конечных разностей')
+            else:
+                tc1, tc2 = st.columns(2)
+                tc1.metric('Обучение PIELM', f'{pm["time"]:.3f} с')
+                tc2.metric('МКР',            f'{fm["time"]:.3f} с')
+
+            png_bar = plot_comparison_bar({
+                'PIELM': {'rmse': pm['rmse_pde_test'], 'time': pm['time']},
+                'МКР':   {'rmse': fm['rmse'],          'time': fm['time']},
+            })
+            st.image(png_bar, use_container_width=True)
+            st.session_state['plots']['comparison_bar.png'] = png_bar
+
+            st.markdown('**Поля давления: PIELM vs МКР**')
+            if is_piezo:
+                t_cmp = st.slider(
+                    'Момент времени t для сравнения',
+                    0.0, float(T_end), float(T_end) / 2,
+                    step=float(T_end) / 20,
+                    key='cmp_t_slider',
+                )
+                X_plot, xx, yy = get_grid_for_plot(n=80, dim=3,
+                                                   T=T_end, t_slice=t_cmp)
+                P_pielm_plot = model.predict(X_plot)
+                P_fdm_plot   = fdm_solver.predict(X_plot)
+                png_cmp = plot_piezo_time_slice(
+                    P_pielm_plot, P_fdm_plot, xx, yy, t_cmp
+                )
+            else:
+                X_plot, xx, yy = get_grid_for_plot(n=80, dim=2)
+                P_pielm_plot = model.predict(X_plot)
+                P_fdm_plot   = fdm_solver.predict(X_plot)
+                png_cmp = plot_pielm_vs_fdm(P_pielm_plot, P_fdm_plot, xx, yy)
+
+            st.image(png_cmp, use_container_width=True)
+            st.session_state['plots']['comparison_fields.png'] = png_cmp
+
+            import pandas as pd
+            st.markdown('**Сводная таблица:**')
+
+            # Формируем строки времени в зависимости от режима
+            if use_ga and pm['t_ga'] is not None:
+                pielm_time_str = (
+                    f'GA: {pm["t_ga"]:.4f} с\n'
+                    f'fit: {pm["t_fit"]:.4f} с\n'
+                    f'итого: {pm["time"]:.4f} с'
+                )
+            else:
+                pielm_time_str = f'{pm["time"]:.4f} с'
+
+            table_data = {
+                'Метод': ['PIELM + GA', 'МКР'],
+                'RMSE невязки PDE (test)': [
+                    f'{pm["rmse_pde_test"]:.8f}', '—',
+                ],
+                'RMSE(PIELM vs МКР)': [
+                    f'{fm["rmse"]:.8f}', f'{fm["rmse"]:.8f}',
+                ],
+                'Время (с)': [
+                    pielm_time_str, f'{fm["time"]:.4f} с',
+                ],
+                'Узлов / точек': [
+                    f'{len(res["X_train"])} коллокац.',
+                    f'{fm["n_grid"]}² = {fm["n_grid"] ** 2} узлов',
+                ],
+            }
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True)
+
+            st.info(
+                '**Пояснение метрик:**\n\n'
+                '— **RMSE невязки PDE** — √mean((L[P] − f)²) — '
+                'насколько точно нейросеть удовлетворяет уравнению. '
+                'Доступна только для PIELM.\n\n'
+                '— **RMSE(PIELM vs МКР)** — √mean((P_PIELM − P_МКР)²) — '
+                'расхождение двух решений на тестовых точках. '
+                'Показывает согласованность методов между собой.'
+            )
+
+    # ── Вкладка 6: Экспорт ────────────────────────────────────────────────
+    with tabs[5]:
+        st.markdown('<div class="section-header">💾 Экспорт результатов</div>',
+                    unsafe_allow_html=True)
+
+        eq_params = {}
+        if is_piezo:
+            eq_params['κ (пьезопроводность)'] = kappa
+            eq_params['T (конечное время)']    = T_end
+
+        txt_report = build_report_txt(
+            equation_name      = res['equation_name'],
+            equation_params    = eq_params,
+            source_name        = res['source_name'],
+            source_params      = src_params,
+            collocation_params = {
+                'Стратегия':                res['sampling'],
+                'N (по оси)':               res['n_colloc'],
+                'N граничных (на сторону)': res['n_bc'],
+                'N train':                  len(res['X_train']),
+                'N test':                   len(res['X_test']),
+            },
+            pielm_params       = {} if use_ga else manual_params,
+            ga_params          = ga_params_cfg or {},
+            ga_history         = st.session_state['ga_history'],
+            best_hyperparams   = res['best_hp'],
+            pielm_metrics      = {
+                'rmse_pde':   pm['rmse_pde_train'],
+                'rmse_train': pm['rmse_pde_train'],
+                'rmse_test':  pm['rmse_pde_test'],
+                'time':       pm['time'],
+            },
+            fdm_metrics        = fm,
+            fdm_enabled        = fdm_enabled,
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown('**📄 Текстовый отчёт**')
+            st.download_button(
+                label             = '⬇️ Скачать отчёт (.txt)',
+                data              = report_to_bytes(txt_report),
+                file_name         = make_filename('report', 'txt'),
+                mime              = 'text/plain',
+                use_container_width=True,
+            )
+            with st.expander('Предпросмотр отчёта'):
+                st.text(txt_report)
+
+        with col2:
+            st.markdown('**🖼️ Графики (ZIP)**')
+            if st.session_state['plots']:
+                zip_bytes = build_plots_zip(st.session_state['plots'])
+                st.download_button(
+                    label             = '⬇️ Скачать все графики (.zip)',
+                    data              = zip_bytes,
+                    file_name         = make_filename('plots', 'zip'),
+                    mime              = 'application/zip',
+                    use_container_width=True,
+                )
+                st.caption(
+                    f'В архиве: {len(st.session_state["plots"])} графиков — '
+                    + ', '.join(st.session_state['plots'].keys())
+                )
+            else:
+                st.info('Сначала просмотрите вкладки с графиками.')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Заглушка до первого запуска
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif not st.session_state['run_complete']:
+    st.info(
+        '👈 Настройте параметры в боковой панели и нажмите '
+        '**▶ Запустить вычисление**'
+    )
+    with st.expander('ℹ️ О приложении'):
+        st.markdown("""
+**PIELM** (Physics-Informed Extreme Learning Machine) — метод решения уравнений
+математической физики с помощью нейронных сетей с фиксированными случайными весами.
+
+**Поддерживаемые уравнения:**
+
+| Уравнение | Вывод | Тип |
+|-----------|-------|-----|
+| Пуассона: ∇²P = f(x,y) | Закон Дарси + div u = 0 | Стационарное |
+| Пьезопроводности: ∂P/∂t = κ·∇²P + q | Закон Дарси + сжимаемость | Нестационарное |
+
+**Генетический алгоритм** автоматически подбирает гиперпараметры PIELM:
+число нейронов, масштаб инициализации, функцию активации, веса λ_pde и λ_bc.
+
+**МКР** (метод конечных разностей) используется как эталон для сравнения:
+- Пуассон: центральные разности, прямое решение СЛАУ
+- Пьезопроводность: схема Кранка–Николсона
+
+**Метрики:**
+- **RMSE невязки PDE (train/test)** — √mean((L[P] − f)²) — насколько
+  точно нейросеть удовлетворяет уравнению в точках построения МНК
+  и в остальной части области
+- **RMSE(PIELM vs МКР)** — √mean((P_PIELM − P_МКР)²) — расхождение
+  двух решений, показывает их согласованность
+        """)
