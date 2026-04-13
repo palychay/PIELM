@@ -301,70 +301,58 @@ def plot_piezo_evolution(P_snapshots, xx, yy, t_vals):
 # 4. Сравнительный график метрик (RMSE, время)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_comparison_bar(metrics):
+def plot_comparison_bar(pielm_rmse, fdm_rmse, pielm_time, fdm_time):
     """
-    Два bar-графика рядом: RMSE и время вычисления.
+    Два subplot сравнения PIELM и МКР.
 
-    Параметры
-    ----------
-    metrics : dict
-        {
-          'PIELM': {'rmse': float, 'time': float},
-          'МКР':   {'rmse': float, 'time': float},
-        }
+    Левый  — RMSE невязки PDE √mean((L[P]−f)²) на тестовых точках:
+             PIELM — из коллокационной аппроксимации
+             МКР   — из численного дифференцирования решения
+             Обе метрики одного смысла и напрямую сравнимы.
 
-    Возвращает
-    ----------
-    bytes PNG
+    Правый — время решения: t_fit (PIELM) vs t_fdm (МКР).
     """
-    methods = list(metrics.keys())
-    rmse    = [metrics[m]['rmse'] for m in methods]
-    times   = [metrics[m]['time'] for m in methods]
-    colors  = [STYLE['color_pielm'], STYLE['color_fdm']]
-
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=STYLE['figsize_double'],
                                    dpi=STYLE['dpi'])
+    methods = ['PIELM', 'МКР']
+    colors  = [STYLE['color_pielm'], STYLE['color_fdm']]
 
-    # ── RMSE ──
-    bars1 = ax1.bar(methods, rmse, color=colors, width=0.5,
-                    edgecolor='white', linewidth=1.5)
-    for bar, val in zip(bars1, rmse):
+    # ── Левый: RMSE невязки PDE ────────────────────────────────────────
+    r_vals = [pielm_rmse, fdm_rmse]
+    bars1  = ax1.bar(methods, r_vals, color=colors, width=0.45,
+                     edgecolor='white', linewidth=1.5)
+    for bar, val in zip(bars1, r_vals):
         ax1.text(bar.get_x() + bar.get_width() / 2,
-                 bar.get_height() + max(rmse) * 0.01,
+                 bar.get_height() + max(r_vals) * 0.02,
                  f'{val:.5f}',
                  ha='center', va='bottom',
-                 fontsize=STYLE['fontsize_label'], fontweight='bold')
-    ax1.set_ylabel('RMSE', fontsize=STYLE['fontsize_label'])
-    ax1.set_title('Точность решения', fontsize=STYLE['fontsize_title'],
-                  fontweight='bold')
+                 fontsize=STYLE['fontsize_label'] + 1, fontweight='bold')
+    ax1.set_ylabel('RMSE невязки PDE', fontsize=STYLE['fontsize_label'])
+    ax1.set_title('Точность\n√mean((L[P]−f)²) на test',
+                  fontsize=STYLE['fontsize_title'], fontweight='bold')
     ax1.tick_params(labelsize=STYLE['fontsize_tick'])
-    ax1.set_ylim(0, max(rmse) * 1.2)
+    ax1.set_ylim(0, max(r_vals) * 1.35)
 
-    # ── Время ──
-    bars2 = ax2.bar(methods, times, color=colors, width=0.5,
-                    edgecolor='white', linewidth=1.5)
-    for bar, val in zip(bars2, times):
+    # ── Правый: время ──────────────────────────────────────────────────
+    t_vals = [pielm_time, fdm_time]
+    bars2  = ax2.bar(methods, t_vals, color=colors, width=0.45,
+                     edgecolor='white', linewidth=1.5)
+    for bar, val in zip(bars2, t_vals):
         ax2.text(bar.get_x() + bar.get_width() / 2,
-                 bar.get_height() + max(times) * 0.01,
-                 f'{val:.3f} с',
+                 bar.get_height() + max(t_vals) * 0.02,
+                 f'{val:.4f} с',
                  ha='center', va='bottom',
-                 fontsize=STYLE['fontsize_label'], fontweight='bold')
-    ax2.set_ylabel('Время вычисления, с', fontsize=STYLE['fontsize_label'])
-    ax2.set_title('Скорость решения', fontsize=STYLE['fontsize_title'],
-                  fontweight='bold')
+                 fontsize=STYLE['fontsize_label'] + 1, fontweight='bold')
+    ax2.set_ylabel('Время, с', fontsize=STYLE['fontsize_label'])
+    ax2.set_title('Время решения\n(t_fit vs t_fdm)',
+                  fontsize=STYLE['fontsize_title'], fontweight='bold')
     ax2.tick_params(labelsize=STYLE['fontsize_tick'])
-    ax2.set_ylim(0, max(times) * 1.2)
+    ax2.set_ylim(0, max(t_vals) * 1.35)
 
     fig.suptitle('Сравнение PIELM и МКР',
-                 fontsize=STYLE['fontsize_title'] + 1,
-                 fontweight='bold')
+                 fontsize=STYLE['fontsize_title'] + 1, fontweight='bold')
     fig.tight_layout()
     return _fig_to_bytes(fig)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Распределение коллокационных точек
-# ─────────────────────────────────────────────────────────────────────────────
 
 def plot_collocation_points(X_train, X_test, X_b, dim=2):
     """

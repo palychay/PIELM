@@ -102,11 +102,13 @@ def build_report_txt(
             row(k + ':', v)
 
     # ── Метрики PIELM ────────────────────────────────────────────────────────
+    # pielm_metrics: rmse_pde (train), rmse_test (test), time (t_fit), t_ga (опц.)
     section('5. МЕТРИКИ PIELM')
-    row('RMSE невязки PDE (train):',  f'{pielm_metrics["rmse_pde"]:.8f}')
-    row('RMSE на train-точках:',       f'{pielm_metrics["rmse_train"]:.8f}')
-    row('RMSE на test-точках:',        f'{pielm_metrics["rmse_test"]:.8f}')
-    row('Время вычисления:',           f'{pielm_metrics["time"]:.4f} с')
+    row('RMSE невязки PDE (train):',   f'{pielm_metrics["rmse_pde"]:.8f}')
+    row('RMSE невязки PDE (test):',    f'{pielm_metrics["rmse_test"]:.8f}')
+    row('Время обучения (t_fit):',     f'{pielm_metrics["time"]:.4f} с')
+    if pielm_metrics.get('t_ga') is not None:
+        row('Время GA (оптимизация):', f'{pielm_metrics["t_ga"]:.4f} с')
 
     # ── Метрики МКР ──────────────────────────────────────────────────────────
     if fdm_enabled and fdm_metrics is not None:
@@ -119,12 +121,14 @@ def build_report_txt(
             f'{fdm_metrics["time"]:.4f} с')
 
         section('7. СРАВНЕНИЕ')
+        # RMSE(PIELM vs МКР) / RMSE невязки PDE (test)
         rmse_ratio = (fdm_metrics['rmse'] / pielm_metrics['rmse_test']
                       if pielm_metrics['rmse_test'] > 0 else float('inf'))
+        # Время МКР / Время обучения PIELM (t_fit)
         time_ratio = (fdm_metrics['time'] / pielm_metrics['time']
                       if pielm_metrics['time'] > 0 else float('inf'))
-        row('RMSE МКР / RMSE PIELM:', f'{rmse_ratio:.4f}')
-        row('Время МКР / Время PIELM:', f'{time_ratio:.4f}')
+        row('RMSE(PIELM vs МКР) / RMSE_pde (test):', f'{rmse_ratio:.4f}')
+        row('Время МКР / Время PIELM (fit):',         f'{time_ratio:.4f}')
 
     lines.append('')
     lines.append('=' * 60)
