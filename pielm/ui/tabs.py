@@ -23,6 +23,9 @@ from ui.export import (
     build_plots_zip,
     make_filename,
 )
+from models.model_io import (
+    model_to_json_bytes,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,3 +320,93 @@ def tab_export(res, cfg):
                        ', '.join(plots.keys()))
         else:
             st.info('Сначала откройте вкладки с графиками.')
+
+    # ── Экспорт модели ────────────────────────────────────────────────────
+    st.markdown('---')
+    st.markdown('<div class="section-header">🧠 Экспорт модели PIELM</div>',
+                unsafe_allow_html=True)
+
+    st.markdown(
+        'Сохранённая модель содержит все веса нейронной сети и может быть '
+        'загружена на **любом языке программирования** (Python, JavaScript, '
+        'C++, MATLAB) без ML-фреймворков. '
+        'Формула предсказания: `P = activation(X @ W + b) @ beta`.'
+    )
+
+    model = res.get('model')
+    if model is None or model.beta is None:
+        st.warning('Модель не обучена. Запустите вычисление.')
+        return
+
+    # Подготовка конфигурации для метаданных
+    model_cfg = {
+        'equation_name': res.get('equation_name', 'unknown'),
+        'is_piezo':      res.get('is_piezo', False),
+        'source_name':   res.get('source_name', 'unknown'),
+        'source_params': res.get('source_params', {}),
+        'kappa':         res.get('kappa', None),
+        'T':             res.get('T_end', None),
+    }
+    model_metrics = {
+        'rmse_pde_train': pm['rmse_pde_train'],
+        'rmse_pde_test':  pm['rmse_pde_test'],
+        'time_fit':       pm['t_fit'],
+    }
+
+    json_bytes = model_to_json_bytes(
+        model, cfg=model_cfg, metrics=model_metrics
+    )
+    st.download_button(
+        label='⬇️ Скачать модель (.json)',
+        data=json_bytes,
+        file_name=make_filename('pielm_model', 'json'),
+        mime='application/json',
+        use_container_width=True,
+    )
+    st.caption(
+        f'Размер: {len(json_bytes)/1024:.1f} КБ · '
+        f'{model.n_hidden} нейронов · {model.act_name}'
+    )
+
+    # Пример кода для загрузки
+    with st.expander('📋 Пример загрузки и предсказания (Python)'):
+        st.code('''import json, numpy as np
+
+# Загрузка модели
+with open("pielm_model.json", "r") as f:
+    m = json.load(f)
+
+W    = np.array(m["weights"]["W"])
+b    = np.array(m["weights"]["b"])
+beta = np.array(m["weights"]["beta"])
+
+# Выбор функции активации
+activations = {"tanh": np.tanh, "sin": np.sin,
+               "sigmoid": lambda z: 1/(1+np.exp(-z))}
+act = activations[m["architecture"]["activation"]]
+
+# Предсказание давления в точке (x=0.5, y=0.3)
+X = np.array([[0.5, 0.3]])
+P = (act(X @ W + b) @ beta).ravel()
+print(f"P(0.5, 0.3) = {P[0]:.6f}")
+''', language='python')
+
+    with st.expander('📋 REST API (FastAPI)'):
+        st.code('''from fastapi import FastAPI
+import json, numpy as np
+
+m = json.load(open("pielm_model.json"))
+W, b, beta = np.array(m["weights"]["W"]), np.array(m["weights"]["b"]), np.array(m["weights"]["beta"])
+act = np.tanh
+
+app = FastAPI()
+
+@app.post("/predict")
+def predict(points: list[list[float]]):
+    X = np.array(points)
+    P = (act(X @ W + b) @ beta).ravel()
+    return {"pressures": P.tolist()}
+
+# Запуск: uvicorn server:app --reload
+# Запрос: curl -X POST localhost:8000/predict -d '[[0.5,0.3]]'
+''', language='python')
