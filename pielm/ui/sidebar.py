@@ -3,6 +3,54 @@ import streamlit as st
 from equations.poisson import POISSON_SOURCE_VARIANTS
 from equations.piezo   import PIEZO_SOURCE_VARIANTS
 from utils.collocation import count_points
+from models.model_io   import load_hyperparams_from_json
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ключи виджетов ручного режима в session_state.
+# Используются и для рендера, и для импорта гиперпараметров из JSON-файла.
+# ─────────────────────────────────────────────────────────────────────────────
+_HP_KEYS = {
+    'n_hidden':   'hp_n_hidden',
+    'scale':      'hp_scale',
+    'activation': 'hp_activation',
+    'lambda_pde': 'hp_lambda_pde',
+    'lambda_bc':  'hp_lambda_bc',
+}
+
+
+def _apply_imported_hyperparams(hp):
+    """
+    Записывает импортированные гиперпараметры в st.session_state
+    под ключами виджетов. Должна вызываться ДО рендера соответствующих
+    виджетов в render_sidebar() — иначе Streamlit проигнорирует значения
+    (нельзя присваивать session_state[key] после создания виджета с этим key).
+    """
+    for hp_name, ss_key in _HP_KEYS.items():
+        st.session_state[ss_key] = hp[hp_name]
+
+
+def _handle_hp_upload():
+    """
+    Обработчик загрузки JSON-файла с гиперпараметрами.
+    Парсит файл, валидирует, записывает в session_state и сохраняет
+    статус-сообщение для отображения после rerun.
+    """
+    uploaded = st.session_state.get('hp_uploader')
+    if uploaded is None:
+        return
+    try:
+        result = load_hyperparams_from_json(uploaded)
+    except (ValueError, KeyError) as e:
+        st.session_state['hp_import_status'] = ('error', str(e))
+        return
+
+    _apply_imported_hyperparams(result['hyperparams'])
+    st.session_state['hp_import_status'] = ('success', {
+        'hp':   result['hyperparams'],
+        'task': result['task'],
+        'meta': result['meta'],
+    })
 
 
 def render_sidebar():
@@ -115,13 +163,67 @@ def render_sidebar():
                 'scale_bounds':  (s_min, s_max),
             }
         else:
+            # ── Импорт гиперпараметров из JSON-файла модели ──────────────
+            with st.expander('📥 Импорт из сохранённой модели (.json)'):
+                st.file_uploader(
+                    'JSON-файл модели PIELM',
+                    type=['json'],
+                    key='hp_uploader',
+                    on_change=_handle_hp_upload,
+                    help=(
+                        'Загрузите ранее сохранённый pielm_model_*.json — '
+                        'гиперпараметры из секции architecture будут '
+                        'подставлены в поля ниже.'
+                    ),
+                )
+
+                # Показываем статус последней попытки импорта
+                status = st.session_state.get('hp_import_status')
+                if status is not None:
+                    kind, payload = status
+                    if kind == 'error':
+                        st.error(f'❌ Ошибка импорта: {payload}')
+                    else:
+                        hp   = payload['hp']
+                        task = payload['task']
+                        meta = payload['meta']
+                        st.success(
+                            f'✅ Импортировано: n_hidden={hp["n_hidden"]}, '
+                            f'scale={hp["scale"]}, activation={hp["activation"]}, '
+                            f'λ_pde={hp["lambda_pde"]}, λ_bc={hp["lambda_bc"]}'
+                        )
+                        if task is not None:
+                            file_is_piezo = task.get('is_piezo', False)
+                            if file_is_piezo != is_piezo:
+                                eq_in_file = ('пьезопроводности'
+                                              if file_is_piezo else 'Пуассона')
+                                st.warning(
+                                    f'⚠️ Файл сохранён для уравнения '
+                                    f'**{eq_in_file}**, а сейчас выбрано другое. '
+                                    f'Гиперпараметры подставлены, но проверьте, '
+                                    f'что они подходят для текущей задачи.'
+                                )
+                            src_in_file = task.get('source_name')
+                            if src_in_file and src_in_file != source_name:
+                                st.caption(
+                                    f'ℹ️ Источник в файле: **{src_in_file}** '
+                                    f'(сейчас выбран: {source_name})'
+                                )
+                        if meta.get('saved_at'):
+                            st.caption(f'Файл сохранён: {meta["saved_at"]}')
+
             st.markdown('**Параметры PIELM:**')
-            n_hidden   = st.slider('n_hidden',    50, 600, 200)
-            scale      = st.slider('scale',       0.5, 15.0, 5.0, step=0.5)
+            n_hidden   = st.slider('n_hidden',    50, 600, 200,
+                                   key=_HP_KEYS['n_hidden'])
+            scale      = st.slider('scale',       0.5, 15.0, 5.0, step=0.5,
+                                   key=_HP_KEYS['scale'])
             activation = st.selectbox('Активация',
-                                      options=['tanh', 'sin', 'sigmoid'])
-            lam_pde    = st.slider('λ_pde', 0.01, 10.0, 1.0, step=0.01)
-            lam_bc     = st.slider('λ_bc',  1.0, 100.0, 10.0, step=1.0)
+                                      options=['tanh', 'sin', 'sigmoid'],
+                                      key=_HP_KEYS['activation'])
+            lam_pde    = st.slider('λ_pde', 0.01, 10.0, 1.0, step=0.01,
+                                   key=_HP_KEYS['lambda_pde'])
+            lam_bc     = st.slider('λ_bc',  1.0, 100.0, 10.0, step=1.0,
+                                   key=_HP_KEYS['lambda_bc'])
             manual_params = {
                 'n_hidden': n_hidden, 'scale': scale,
                 'activation': activation,

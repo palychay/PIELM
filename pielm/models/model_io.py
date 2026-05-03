@@ -417,3 +417,127 @@ def predict_from_json(json_path, X):
     P : ndarray (N,)
     """
     return predict_from_dict(load_model_dict(json_path), X)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Импорт гиперпараметров из сохранённого JSON-файла модели
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Допустимые значения активации и валидные диапазоны гиперпараметров
+# (должны совпадать с диапазонами слайдеров в ui/sidebar.py)
+_VALID_ACTIVATIONS = ('tanh', 'sin', 'sigmoid')
+_HP_BOUNDS = {
+    'n_hidden':   (50,  600),
+    'scale':      (0.5, 15.0),
+    'lambda_pde': (0.01, 10.0),
+    'lambda_bc':  (1.0,  100.0),
+}
+
+
+def load_hyperparams_from_json(source):
+    """
+    Извлекает гиперпараметры PIELM из сохранённого JSON-файла модели.
+
+    Берёт только секцию `architecture` — веса (W, b, beta) игнорируются.
+    Это позволяет переиспользовать ранее найденные GA гиперпараметры
+    для нового запуска (например, на другом источнике или другой сетке).
+
+    Параметры
+    ----------
+    source : str | Path | bytes | file-like
+        Путь к .json файлу, либо байты содержимого, либо file-like объект
+        (например, результат st.file_uploader в Streamlit).
+
+    Возвращает
+    ----------
+    result : dict с ключами:
+        'hyperparams' : dict — {'n_hidden', 'scale', 'activation',
+                                'lambda_pde', 'lambda_bc'}
+                        — готов к подстановке в PIELM(...) или в session_state
+        'task'        : dict | None — секция task из файла (для предупреждений
+                        пользователю: equation, is_piezo, source_name и т.д.)
+        'meta'        : dict — saved_at, version (информационно)
+
+    Исключения
+    ----------
+    ValueError — если файл не является валидным JSON-сохранением модели PIELM,
+                 либо если значения гиперпараметров вне допустимых диапазонов.
+
+    Пример
+    ------
+    >>> hp = load_hyperparams_from_json("pielm_model_20250101.json")
+    >>> hp['hyperparams']
+    {'n_hidden': 256, 'scale': 7.3, 'activation': 'tanh',
+     'lambda_pde': 1.0, 'lambda_bc': 12.0}
+    """
+    # ── Читаем JSON из любого источника ─────────────────────────────────────
+    if isinstance(source, (str, Path)):
+        with open(source, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    elif isinstance(source, bytes):
+        raw = json.loads(source.decode('utf-8'))
+    elif hasattr(source, 'read'):
+        # file-like (включая st.UploadedFile)
+        content = source.read()
+        if isinstance(content, bytes):
+            content = content.decode('utf-8')
+        raw = json.loads(content)
+    else:
+        raise ValueError(
+            f'Неподдерживаемый тип источника: {type(source).__name__}. '
+            'Ожидается путь к файлу, bytes или file-like объект.'
+        )
+
+    # ── Валидация: это действительно файл модели PIELM? ─────────────────────
+    if not isinstance(raw, dict):
+        raise ValueError('Файл не содержит JSON-объект.')
+
+    if raw.get('model_type') != 'PIELM':
+        raise ValueError(
+            f'Это не файл модели PIELM '
+            f'(model_type = {raw.get("model_type", "отсутствует")!r}).'
+        )
+
+    arch = raw.get('architecture')
+    if not isinstance(arch, dict):
+        raise ValueError('В файле отсутствует секция "architecture".')
+
+    # ── Извлекаем гиперпараметры ────────────────────────────────────────────
+    required_keys = ('n_hidden', 'scale', 'activation', 'lambda_pde', 'lambda_bc')
+    missing = [k for k in required_keys if k not in arch]
+    if missing:
+        raise ValueError(
+            f'В секции "architecture" отсутствуют ключи: {missing}'
+        )
+
+    hp = {
+        'n_hidden':   int(arch['n_hidden']),
+        'scale':      float(arch['scale']),
+        'activation': str(arch['activation']),
+        'lambda_pde': float(arch['lambda_pde']),
+        'lambda_bc':  float(arch['lambda_bc']),
+    }
+
+    # ── Проверка валидности значений ────────────────────────────────────────
+    if hp['activation'] not in _VALID_ACTIVATIONS:
+        raise ValueError(
+            f'Неизвестная активация: {hp["activation"]!r}. '
+            f'Допустимые: {_VALID_ACTIVATIONS}'
+        )
+
+    for key, (lo, hi) in _HP_BOUNDS.items():
+        val = hp[key]
+        if not (lo <= val <= hi):
+            raise ValueError(
+                f'Значение {key} = {val} вне допустимого диапазона '
+                f'[{lo}, {hi}].'
+            )
+
+    return {
+        'hyperparams': hp,
+        'task': raw.get('task'),
+        'meta': {
+            'saved_at': raw.get('saved_at'),
+            'version':  raw.get('version'),
+        },
+    }
